@@ -1,0 +1,12 @@
+{
+  "name": "universal-shell-electron",
+  "version": "0.1.0",
+  "private": true,
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "electron ."
+  },
+  "devDependencies": {
+    "electron": "^33.3.1"
+  }
+}
