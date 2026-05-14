@@ -4,6 +4,7 @@ import { addLog } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
 import { renderImagePreview, renderThumbButton } from "../../components/media.js";
 import { formatTime } from "../../core/format.js";
+import { runFeishuPriceSync } from "../../core/feishu-price-sync.js";
 
 let selectedShop = "";
 let skuCodeQuery = "";
@@ -68,7 +69,12 @@ async function syncFeishuPrices() {
   addLog("info", "开始匹配飞书价格", "全局读取飞书价格表，按 SKU编码 回填所有店铺SKU");
   await window.renderActiveModule();
   try {
-    const result = await api.post("/products/skus/prices/sync");
+    const syncResult = await runFeishuPriceSync();
+    if (syncResult.skipped) {
+      addLog("info", "匹配飞书价格已在执行", "后台轮询或其他页面正在匹配，请稍后再试");
+      return;
+    }
+    const result = syncResult.result;
     skus = await loadSkus();
     addLog(
       "success",

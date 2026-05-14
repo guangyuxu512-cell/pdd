@@ -4,6 +4,7 @@ import { addLog, endTask, startTask } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
 import { renderImagePreview, renderThumbButton } from "../../components/media.js";
 import { formatMoney, formatTime, normalizeNumber } from "../../core/format.js";
+import { runFeishuPriceSync } from "../../core/feishu-price-sync.js";
 
 let selectedShop = "";
 let activeTab = "signup";
@@ -300,7 +301,12 @@ async function syncFeishuPricesFromWorkbench(render = true) {
   addLog("info", "开始飞书匹配价格", "按 SKU 编码回填正常售价和顺手报名价；无顺手报名价的SKU报名时自动忽略");
   if (render) await window.renderActiveModule();
   try {
-    const result = await api.post("/products/skus/prices/sync");
+    const syncResult = await runFeishuPriceSync();
+    if (syncResult.skipped) {
+      addLog("info", "飞书匹配价格已在执行", "后台轮询或其他页面正在匹配，请稍后再试");
+      return;
+    }
+    const result = syncResult.result;
     readiness = await loadReadiness();
     addLog("success", "飞书匹配价格完成", `更新SKU ${result.updated_global_skus + result.updated_shop_skus} 条，警告 ${result.warnings.length}`);
   } catch (error) {

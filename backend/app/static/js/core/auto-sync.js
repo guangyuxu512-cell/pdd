@@ -1,9 +1,8 @@
-import { api } from "../api/client.js";
 import { addLog } from "./state.js";
+import { runFeishuPriceSync } from "./feishu-price-sync.js";
 
 const FEISHU_PRICE_SYNC_INTERVAL_MS = 60 * 1000;
 
-let feishuPriceSyncRunning = false;
 let feishuPriceSyncTimer = null;
 let lastFailureMessage = "";
 
@@ -16,10 +15,10 @@ export function startAutoSync() {
 }
 
 async function runAutoFeishuPriceSync(reason) {
-  if (feishuPriceSyncRunning) return;
-  feishuPriceSyncRunning = true;
   try {
-    const result = await api.post("/products/skus/prices/sync");
+    const syncResult = await runFeishuPriceSync();
+    if (syncResult.skipped) return;
+    const result = syncResult.result;
     lastFailureMessage = "";
     const updatedCount = Number(result.updated_global_skus || 0) + Number(result.updated_shop_skus || 0);
     addLog(
@@ -35,7 +34,5 @@ async function runAutoFeishuPriceSync(reason) {
       addLog("error", "自动飞书匹配价格失败", error.message);
       lastFailureMessage = error.message;
     }
-  } finally {
-    feishuPriceSyncRunning = false;
   }
 }

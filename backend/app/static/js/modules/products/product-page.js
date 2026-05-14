@@ -4,6 +4,7 @@ import { addLog, endTask, startTask } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
 import { renderImagePreview, renderThumbButton } from "../../components/media.js";
 import { formatTime, normalizeNumber } from "../../core/format.js";
+import { runFeishuPriceSync } from "../../core/feishu-price-sync.js";
 
 let selectedShop = "";
 let productIdQuery = "";
@@ -77,7 +78,7 @@ function renderProductPanel(shops) {
         el("button", { class: "primary", onclick: queryProduct }, ["查询"]),
         statusSelect(),
         el("button", { class: "compact-action", onclick: fetchProductList, disabled: fetchingProducts }, ["1 商品列表"]),
-        el("button", { class: "compact-action", onclick: () => syncSelectedSkus("incremental"), disabled: fetchingSkus }, ["2 SKU"]),
+        el("button", { class: "compact-action", onclick: openSkuSyncModal, disabled: fetchingSkus }, ["2 SKU"]),
         el("button", { class: "compact-action", onclick: syncProductPageFeishuPrices }, ["3 飞书匹配价格"]),
         el("button", { class: "compact-action", onclick: syncProductPagePxi }, ["4 PXI"]),
         el("button", { class: "compact-action", onclick: syncProductPageActivities }, ["5 活动ID"]),
@@ -271,7 +272,12 @@ async function syncProductPageFeishuPrices() {
   const taskId = startTask("正在飞书匹配价格", selectedShop ? shopLabel(selectedShop) : "全部店铺");
   addLog("info", "开始飞书匹配价格", "按 SKU 编码全局回填正常售价和顺手报名价");
   try {
-    const result = await api.post("/products/skus/prices/sync");
+    const syncResult = await runFeishuPriceSync();
+    if (syncResult.skipped) {
+      addLog("info", "飞书匹配价格已在执行", "后台轮询或其他页面正在匹配，请稍后再试");
+      return;
+    }
+    const result = syncResult.result;
     addLog("success", "飞书匹配价格完成", `更新SKU ${Number(result.updated_global_skus || 0) + Number(result.updated_shop_skus || 0)} 条，警告 ${(result.warnings || []).length}`);
   } catch (error) {
     addLog("error", "飞书匹配价格失败", error.message);
