@@ -4,6 +4,7 @@ export const state = {
   activeModule: "shunshou",
   logs: [],
   activeTasks: [],
+  theme: localStorage.getItem("app-theme") || "light",
 };
 
 export function subscribe(listener) {
@@ -13,6 +14,13 @@ export function subscribe(listener) {
 
 export function setActiveModule(moduleId) {
   state.activeModule = moduleId;
+  emit();
+}
+
+export function setTheme(theme) {
+  state.theme = theme === "dark" ? "dark" : "light";
+  localStorage.setItem("app-theme", state.theme);
+  document.documentElement.dataset.theme = state.theme;
   emit();
 }
 

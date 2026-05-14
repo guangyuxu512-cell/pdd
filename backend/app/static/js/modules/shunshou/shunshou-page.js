@@ -1,4 +1,4 @@
-import { api } from "../../api/client.js";
+﻿import { api } from "../../api/client.js";
 import { el, formValue } from "../../core/dom.js";
 import { addLog, endTask, startTask } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
@@ -67,12 +67,9 @@ function renderPanel(shops) {
         el("div", { class: "panel-title", text: "顺手报名工作台" }),
         el("div", { class: "actions" }, [
           shopSelect(shops),
-          el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts, onclick: syncProductsFromWorkbench }, ["1 商品列表"]),
-          el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts, onclick: syncSkusFromWorkbench }, ["2 SKU价/库存"]),
-          el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts, onclick: syncFeishuPricesFromWorkbench }, ["3 飞书匹配价格"]),
-          el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts, onclick: syncPxiFromWorkbench }, ["4 PXI分"]),
-          el("button", { disabled: syncingActivities || signingUp || relistingSignupProducts, onclick: syncActivities }, [syncingActivities ? "获取中..." : "5 活动ID"]),
-          el("button", { disabled: syncingItems || signingUp || relistingSignupProducts, onclick: syncAllActivityItems }, [syncingItems ? "获取中..." : "6 活动商品"]),
+          el("button", { class: "primary", disabled: previewingSignup || signingUp || relistingSignupProducts || syncingActivities || syncingItems, onclick: syncWorkbenchChain }, [
+            previewingSignup || syncingActivities || syncingItems ? "更新中..." : "一键更新",
+          ]),
         ]),
       ]),
       el("span", { class: "badge", text: badgeText() }),
@@ -202,6 +199,22 @@ async function handleReadinessAction(name) {
   }
 }
 
+async function syncWorkbenchChain() {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  addLog("info", "开始一键更新", "商品列表 -> 增量SKU -> PXI分 -> 活动ID -> 活动商品；飞书价格由后台轮询匹配");
+  await syncProductsFromWorkbench(false);
+  await syncSkusFromWorkbench(false);
+  await syncPxiFromWorkbench(false);
+  await syncActivities(false);
+  await syncAllActivityItems(false);
+  readiness = await loadReadiness();
+  await window.renderActiveModule();
+  addLog("success", "一键更新完成", "已跳过飞书匹配价格，后台轮询会自动全局匹配");
+}
+
 async function syncProductsFromWorkbench(render = true) {
   if (!selectedShop) {
     alert("请先选择店铺");
@@ -234,13 +247,17 @@ async function syncSkusFromWorkbench(render = true) {
   const [platform, shop_id] = selectedShop.split("::");
   previewingSignup = true;
   const taskId = startTask("正在同步SKU价/库存", shopLabel(selectedShop));
-  addLog("info", "开始一键SKU价/库存", "同步当前有效商品的SKU编码、当前价和库存");
+  addLog("info", "开始一键SKU价/库存", "增量补齐缺失的SKU编码、当前价和库存");
   if (render) await window.renderActiveModule();
   try {
     const products = await api.get(`/products?${new URLSearchParams({ platform, shop_id }).toString()}`);
-    const productIds = products.filter((product) => product.status !== "deleted").map((product) => product.product_id);
+    const existingSkus = await api.get(`/products/skus?${new URLSearchParams({ platform, shop_id }).toString()}`);
+    const hasSkuIds = new Set(existingSkus.map((sku) => String(sku.product_id)));
+    const productIds = products
+      .filter((product) => product.status !== "deleted" && !hasSkuIds.has(String(product.product_id)))
+      .map((product) => product.product_id);
     if (!productIds.length) {
-      addLog("info", "一键SKU价/库存", "当前没有有效商品");
+      addLog("success", "一键SKU价/库存", "当前商品都已有 SKU 数据");
       return;
     }
     const batches = chunk(productIds, 5);

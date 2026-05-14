@@ -1,5 +1,5 @@
 import { el } from "../core/dom.js";
-import { setActiveModule, state } from "../core/state.js";
+import { setActiveModule, setTheme, state } from "../core/state.js";
 
 export const modules = [
   { id: "shops", title: "店铺管理" },
@@ -9,6 +9,7 @@ export const modules = [
 ];
 
 export function renderShell(root) {
+  document.documentElement.dataset.theme = state.theme;
   root.innerHTML = `
     <div class="app-shell">
       <aside class="sidebar">
@@ -18,6 +19,7 @@ export function renderShell(root) {
         </div>
         <nav class="menu" id="menu"></nav>
         <div class="sidebar-footer">
+          <button class="theme-toggle" id="theme-toggle"></button>
           <div>Backend: 127.0.0.1:8800</div>
           <div>SQLite / Local Profile</div>
         </div>
@@ -65,6 +67,11 @@ export function renderMenu() {
       ),
     ),
   );
+  const themeToggle = document.getElementById("theme-toggle");
+  if (themeToggle) {
+    themeToggle.textContent = state.theme === "dark" ? "浅色主题" : "深色主题";
+    themeToggle.onclick = () => setTheme(state.theme === "dark" ? "light" : "dark");
+  }
 }
 
 export function setPageTitle(title) {

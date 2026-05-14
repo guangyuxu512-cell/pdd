@@ -1,5 +1,5 @@
 import { api } from "../api/client.js";
-import { addLog, state } from "./state.js";
+import { addLog } from "./state.js";
 
 const FEISHU_PRICE_SYNC_INTERVAL_MS = 60 * 1000;
 
@@ -30,7 +30,6 @@ async function runAutoFeishuPriceSync(reason) {
     if ((result.warnings || []).length) {
       addLog("error", "自动飞书价格警告", result.warnings.slice(0, 3).join("；"));
     }
-    await runShunshouAutoPriceChangeDetection(updatedCount);
   } catch (error) {
     if (error.message !== lastFailureMessage) {
       addLog("error", "自动飞书匹配价格失败", error.message);
@@ -39,10 +38,4 @@ async function runAutoFeishuPriceSync(reason) {
   } finally {
     feishuPriceSyncRunning = false;
   }
-}
-
-async function runShunshouAutoPriceChangeDetection(updatedCount) {
-  if (state.activeModule !== "shunshou") return;
-  if (typeof window.autoDetectShunshouSignupPriceChanges !== "function") return;
-  await window.autoDetectShunshouSignupPriceChanges({ source: "auto_feishu_price_sync", updatedCount });
 }

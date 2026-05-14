@@ -1,4 +1,4 @@
-import { api } from "../../api/client.js";
+﻿import { api } from "../../api/client.js";
 import { el, formValue } from "../../core/dom.js";
 import { addLog, endTask, startTask } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
@@ -11,6 +11,7 @@ let statusFilter = "";
 let products = [];
 let fetchingProducts = false;
 let fetchingSkus = false;
+let skuSyncModalOpen = false;
 let relistingProducts = false;
 let relistModalOpen = false;
 let relistStock = 3;
@@ -54,9 +55,6 @@ function renderProductPanel(shops) {
             fetchingProducts ? "获取中..." : "获取商品ID",
           ]),
           el("button", { disabled: !fetchingProducts, onclick: stopFetchProducts }, ["停止获取"]),
-          el("button", { disabled: fetchingSkus, onclick: syncSelectedSkus }, [
-            fetchingSkus ? "同步SKU中..." : "同步SKU价/库存",
-          ]),
           el("button", { id: "product-relist-button", disabled: relistingProducts || selectedProductIds.size === 0, onclick: openRelistModal }, [
             relistingProducts ? "执行中..." : "一键修改",
           ]),
@@ -78,9 +76,16 @@ function renderProductPanel(shops) {
         }),
         el("button", { class: "primary", onclick: queryProduct }, ["查询"]),
         statusSelect(),
+        el("button", { class: "compact-action", onclick: fetchProductList, disabled: fetchingProducts }, ["1 商品列表"]),
+        el("button", { class: "compact-action", onclick: () => syncSelectedSkus("incremental"), disabled: fetchingSkus }, ["2 SKU"]),
+        el("button", { class: "compact-action", onclick: syncProductPageFeishuPrices }, ["3 飞书匹配价格"]),
+        el("button", { class: "compact-action", onclick: syncProductPagePxi }, ["4 PXI"]),
+        el("button", { class: "compact-action", onclick: syncProductPageActivities }, ["5 活动ID"]),
+        el("button", { class: "compact-action", onclick: syncProductPageActivityItems }, ["6 活动商品"]),
       ]),
       renderProductTable(),
       renderPager(),
+      renderSkuSyncModal(),
       renderRelistModal(),
       renderImagePreviewModal(),
     ]),
@@ -173,22 +178,46 @@ async function fetchProductList() {
   }
 }
 
-async function syncSelectedSkus() {
+async function openSkuSyncModal() {
   if (!selectedShop) {
     alert("请先选择店铺");
     return;
   }
+  skuSyncModalOpen = true;
+  await window.renderActiveModule();
+}
+
+async function closeSkuSyncModal() {
+  skuSyncModalOpen = false;
+  await window.renderActiveModule();
+}
+
+async function syncSelectedSkus(mode = "incremental") {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  skuSyncModalOpen = false;
   const [platform, shop_id] = selectedShop.split("::");
   const selectableIds = new Set(products.filter(isSelectableProduct).map((product) => product.product_id));
-  let productIds = [...selectedProductIds].filter((productId) => selectableIds.has(productId));
-  let mode = "勾选更新";
-  if (!productIds.length) {
+  let productIds = [];
+  let modeText = "增量补缺";
+  if (mode === "selected") {
+    productIds = [...selectedProductIds].filter((productId) => selectableIds.has(productId));
+    modeText = "刷新选中";
+    if (!productIds.length) {
+      alert("请先勾选要刷新SKU的商品");
+      return;
+    }
+  } else if (mode === "force_all") {
+    productIds = products.filter(isSelectableProduct).map((product) => product.product_id);
+    modeText = "强制全量";
+  } else {
     const existingSkus = await api.get(`/products/skus?${new URLSearchParams({ platform, shop_id }).toString()}`);
     const hasSkuIds = new Set(existingSkus.map((sku) => sku.product_id));
     productIds = products
       .filter((product) => product.status !== "deleted" && !hasSkuIds.has(product.product_id))
       .map((product) => product.product_id);
-    mode = "自动补齐未获取";
   }
   if (!productIds.length) {
     addLog("success", "同步SKU价/库存", "当前商品都已有 SKU 数据");
@@ -198,7 +227,7 @@ async function syncSelectedSkus() {
   const taskId = startTask("正在同步SKU价/库存", `${productIds.length} 个商品`);
   const batches = chunk(productIds, 5);
   const totals = { count: 0, inserted: 0, updated: 0, inactive: 0, failed: 0 };
-  addLog("info", "开始同步SKU价/库存", `${mode}，${productIds.length} 个商品，${batches.length} 批，每批最多 5 个，随机等待 2-4 秒`);
+  addLog("info", "开始同步SKU价/库存", `${modeText}，${productIds.length} 个商品，${batches.length} 批，每批最多 5 个，随机等待 2-4 秒`);
   await window.renderActiveModule();
   try {
     for (let index = 0; index < batches.length; index += 1) {
@@ -236,6 +265,106 @@ async function syncSelectedSkus() {
     endTask(taskId);
     await window.renderActiveModule();
   }
+}
+
+async function syncProductPageFeishuPrices() {
+  const taskId = startTask("正在飞书匹配价格", selectedShop ? shopLabel(selectedShop) : "全部店铺");
+  addLog("info", "开始飞书匹配价格", "按 SKU 编码全局回填正常售价和顺手报名价");
+  try {
+    const result = await api.post("/products/skus/prices/sync");
+    addLog("success", "飞书匹配价格完成", `更新SKU ${Number(result.updated_global_skus || 0) + Number(result.updated_shop_skus || 0)} 条，警告 ${(result.warnings || []).length}`);
+  } catch (error) {
+    addLog("error", "飞书匹配价格失败", error.message);
+    alert(error.message);
+  } finally {
+    endTask(taskId);
+  }
+}
+
+async function syncProductPagePxi() {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  const [platform, shop_id] = selectedShop.split("::");
+  const taskId = startTask("正在获取PXI分", shopLabel(selectedShop));
+  addLog("info", "开始获取PXI分", "同步当前店铺商品PXI分");
+  try {
+    const result = await api.post("/pxi/sync", { platform, shop_id });
+    addLog("success", "获取PXI分完成", `获取 ${result.count || 0} 条，新增 ${result.inserted || 0}，更新 ${result.updated || 0}，失效 ${result.inactive || 0}，日期 ${result.update_date || ""}`);
+  } catch (error) {
+    addLog("error", "获取PXI分失败", error.message);
+    alert(error.message);
+  } finally {
+    endTask(taskId);
+  }
+}
+
+async function syncProductPageActivities() {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  const [platform, shop_id] = selectedShop.split("::");
+  const taskId = startTask("正在获取活动ID", shopLabel(selectedShop));
+  addLog("info", "开始获取活动ID", "同步顺手活动列表");
+  try {
+    const result = await api.post("/shunshou/activities/sync", { platform, shop_id, activity_status: "null" });
+    addLog("success", "获取活动ID完成", `活动 ${result.count || 0} 个，新增 ${result.inserted || 0}，更新 ${result.updated || 0}，失效 ${result.inactive || 0}`);
+  } catch (error) {
+    addLog("error", "获取活动ID失败", error.message);
+    alert(error.message);
+  } finally {
+    endTask(taskId);
+  }
+}
+
+async function syncProductPageActivityItems() {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  const [platform, shop_id] = selectedShop.split("::");
+  const taskId = startTask("正在获取活动商品", shopLabel(selectedShop));
+  addLog("info", "开始获取活动商品", "逐个活动同步已报名/可报名商品状态");
+  try {
+    const activities = await api.get(`/shunshou/activities?${new URLSearchParams({ platform, shop_id }).toString()}`);
+    const activeActivities = activities.filter((activity) => activity.sync_status !== "deleted");
+    let total = 0;
+    for (const activity of activeActivities) {
+      const result = await api.post("/shunshou/activity-items/sync", {
+        platform,
+        shop_id,
+        activity_id: activity.activity_id,
+        auction_status: 0,
+      });
+      total += result.count || 0;
+    }
+    addLog("success", "获取活动商品完成", `活动 ${activeActivities.length} 个，商品 ${total} 条`);
+  } catch (error) {
+    addLog("error", "获取活动商品失败", error.message);
+    alert(error.message);
+  } finally {
+    endTask(taskId);
+  }
+}
+
+function renderSkuSyncModal() {
+  if (!skuSyncModalOpen) return "";
+  const selectedCount = selectedProductIds.size;
+  return el("div", { class: "modal-mask open", onclick: closeSkuSyncModal }, [
+    el("div", { class: "modal sku-sync-modal", onclick: (event) => event.stopPropagation() }, [
+      el("div", { class: "modal-header" }, [
+        el("strong", { text: "一键SKU" }),
+        el("button", { onclick: closeSkuSyncModal }, ["关闭"]),
+      ]),
+      el("div", { class: "modal-body sku-sync-actions" }, [
+        el("button", { class: "primary", onclick: () => syncSelectedSkus("incremental") }, ["增量补缺"]),
+        el("button", { disabled: selectedCount === 0, onclick: () => syncSelectedSkus("selected") }, [`刷新选中 ${selectedCount}`]),
+        el("button", { onclick: () => syncSelectedSkus("force_all") }, ["强制全量"]),
+      ]),
+    ]),
+  ]);
 }
 
 async function openRelistModal() {

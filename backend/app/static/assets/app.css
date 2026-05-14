@@ -1,6 +1,7 @@
 :root {
   --bg: #f3f5f8;
   --panel: #ffffff;
+  --surface: #ffffff;
   --line: #dfe4ea;
   --line-strong: #cbd5e1;
   --text: #1f2937;
@@ -9,8 +10,26 @@
   --brand-soft: #eff6ff;
   --danger: #dc2626;
   --success: #059669;
+  --table-head: #f8fafc;
+  --shadow: rgba(15, 23, 42, 0.18);
   font-size: 13px;
   font-family: "Microsoft YaHei", "Segoe UI", Arial, sans-serif;
+}
+
+:root[data-theme="dark"] {
+  --bg: #0f172a;
+  --panel: #111827;
+  --surface: #1f2937;
+  --line: #334155;
+  --line-strong: #475569;
+  --text: #e5e7eb;
+  --muted: #94a3b8;
+  --brand: #3b82f6;
+  --brand-soft: #172554;
+  --danger: #f87171;
+  --success: #34d399;
+  --table-head: #1e293b;
+  --shadow: rgba(0, 0, 0, 0.35);
 }
 
 * {
@@ -36,7 +55,7 @@ button {
   padding: 0 9px;
   border: 1px solid var(--line-strong);
   border-radius: 5px;
-  background: #fff;
+  background: var(--surface);
   color: var(--text);
   cursor: pointer;
   font-size: 12px;
@@ -65,7 +84,8 @@ select {
   padding: 0 8px;
   border: 1px solid var(--line-strong);
   border-radius: 5px;
-  background: #fff;
+  background: var(--surface);
+  color: var(--text);
   font-size: 13px;
 }
 
@@ -98,7 +118,7 @@ td {
 th {
   color: var(--muted);
   font-weight: 600;
-  background: #f8fafc;
+  background: var(--table-head);
 }
 
 .data-table th {
@@ -155,9 +175,9 @@ th {
 }
 
 .menu button.active {
-  border-color: #bfdbfe;
+  border-color: var(--line-strong);
   background: var(--brand-soft);
-  color: #1d4ed8;
+  color: var(--brand);
   font-weight: 600;
 }
 
@@ -274,7 +294,7 @@ th {
   font-family: Consolas, "Courier New", monospace;
   font-size: 13px;
   font-weight: 500;
-  background: #fff;
+  background: var(--panel);
 }
 
 .log-row {
@@ -282,11 +302,11 @@ th {
   grid-template-columns: 86px 72px minmax(0, 1fr);
   gap: 10px;
   padding: 5px 0;
-  border-bottom: 1px solid #eef2f7;
+  border-bottom: 1px solid var(--line);
 }
 
 .log-level-info {
-  color: #2563eb;
+  color: var(--brand);
 }
 
 .log-level-success {
@@ -355,18 +375,45 @@ th {
 
 .product-toolbar {
   display: grid;
-  grid-template-columns: 260px 90px 120px minmax(0, 1fr);
+  grid-template-columns: 220px 72px 120px repeat(6, auto) minmax(0, 1fr);
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   margin-bottom: 10px;
 }
 
 .product-id-query {
-  width: 260px;
+  width: 220px;
 }
 
 .product-status-filter {
   width: 120px;
+}
+
+.compact-action {
+  height: 32px;
+  padding: 0 10px;
+  white-space: nowrap;
+}
+
+.sku-sync-modal {
+  width: min(420px, calc(100vw - 40px));
+}
+
+.sku-sync-modal .modal-header {
+  min-height: 44px;
+}
+
+.sku-sync-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+  padding-top: 10px;
+}
+
+.sku-sync-actions button {
+  height: 38px;
+  min-width: 0;
+  padding: 0 10px;
 }
 
 .sku-toolbar {
@@ -403,13 +450,13 @@ th {
 }
 
 .shunshou-toolbar button {
-  flex: 0 1 148px;
-  min-width: 112px;
-  max-width: 210px;
-  height: 34px;
-  padding: 0 12px;
+  flex: 0 1 auto;
+  min-width: 86px;
+  max-width: 160px;
+  height: 28px;
+  padding: 0 9px;
   white-space: nowrap;
-  font-size: 13px;
+  font-size: 12px;
 }
 
 .shunshou-toolbar .muted {
@@ -460,7 +507,7 @@ th {
 .tab-button.active {
   border-color: var(--brand);
   background: var(--brand-soft);
-  color: #1d4ed8;
+  color: var(--brand);
   font-weight: 600;
 }
 
@@ -475,6 +522,11 @@ th {
   align-items: center;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.theme-toggle {
+  width: 100%;
+  margin-bottom: 8px;
 }
 
 .action-cell .actions {
@@ -533,9 +585,9 @@ th {
 }
 
 .signup-activity-button.active {
-  border-color: #2563eb;
-  color: #1d4ed8;
-  background: #eff6ff;
+  border-color: var(--brand);
+  color: var(--brand);
+  background: var(--brand-soft);
 }
 
 .signup-activity-modal {
@@ -548,7 +600,7 @@ th {
 
 .signup-activity-product-id {
   font-weight: 700;
-  color: #111827;
+  color: var(--text);
 }
 
 .signup-activity-picker-actions {
@@ -583,16 +635,16 @@ th {
 
 .signup-activity-picker-id {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  color: #334155;
+  color: var(--muted);
 }
 
 .signup-activity-picker-name {
   overflow-wrap: anywhere;
-  color: #111827;
+  color: var(--text);
 }
 
 .signup-activity-joined {
-  color: #1d4ed8;
+  color: var(--brand);
   font-size: 12px;
   white-space: nowrap;
 }
@@ -604,7 +656,7 @@ th {
   padding: 8px 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
-  background: #fff;
+  background: var(--panel);
 }
 
 .readiness-summary {
@@ -626,9 +678,9 @@ th {
 .readiness-chip {
   height: 30px;
   padding: 0 10px;
-  border-color: #fecaca;
+  border-color: var(--line-strong);
   color: var(--danger);
-  background: #fff7f7;
+  background: var(--surface);
   white-space: nowrap;
 }
 
@@ -654,10 +706,10 @@ th {
   width: min(720px, calc(100vw - 40px));
   max-height: calc(100vh - 40px);
   overflow: auto;
-  background: #fff;
+  background: var(--panel);
   border: 1px solid var(--line);
   border-radius: 6px;
-  box-shadow: 0 18px 48px rgba(15, 23, 42, 0.18);
+  box-shadow: 0 18px 48px var(--shadow);
 }
 
 .modal-header {
