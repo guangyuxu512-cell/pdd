@@ -2,6 +2,8 @@ import { api } from "../../api/client.js";
 import { el, formValue } from "../../core/dom.js";
 import { addLog } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
+import { renderImagePreview, renderThumbButton } from "../../components/media.js";
+import { formatTime } from "../../core/format.js";
 
 let selectedShop = "";
 let productIdQuery = "";
@@ -95,7 +97,7 @@ async function syncPxiRows() {
   syncing = true;
   const updateDate = formValue("pxi-update-date");
   const itemId = formValue("pxi-product-id-query");
-  addLog("info", "开始获取PXI", `${shopLabel(selectedShop)} / ${updateDate || "默认昨天"} / 固定60条每页`);
+  addLog("info", "开始获取PXI", `${shopLabel(selectedShop)} / ${updateDate || "自动日期"} / 固定60条每页`);
   await window.renderActiveModule();
   try {
     const result = await api.post("/pxi/sync", {
@@ -227,25 +229,11 @@ function pagedRows() {
 }
 
 function renderProductThumb(url) {
-  if (!url) return "";
-  return el("button", { class: "product-thumb-button", title: "查看主图", onclick: () => openImagePreview(url) }, [
-    el("img", { class: "product-thumb", src: url, alt: "主图", loading: "lazy" }),
-    el("span", { class: "product-thumb-eye" }),
-  ]);
+  return renderThumbButton(url, { onOpen: openImagePreview });
 }
 
 function renderImagePreviewModal() {
-  return el("div", { class: previewImageUrl ? "modal-mask open" : "modal-mask", onclick: closeImagePreview }, [
-    el("div", { class: "image-preview-modal", onclick: (event) => event.stopPropagation() }, [
-      el("div", { class: "modal-header" }, [
-        el("strong", { text: "主图预览" }),
-        el("button", { class: "ghost", onclick: closeImagePreview }, ["关闭"]),
-      ]),
-      el("div", { class: "image-preview-body" }, [
-        previewImageUrl ? el("img", { class: "image-preview", src: previewImageUrl, alt: "主图预览" }) : "",
-      ]),
-    ]),
-  ]);
+  return renderImagePreview({ url: previewImageUrl, onClose: closeImagePreview });
 }
 
 async function openImagePreview(url) {
@@ -279,9 +267,4 @@ function statusLabel(status) {
 function shopLabel(value) {
   const shop = shopOptions.find((item) => `${item.platform}::${item.shop_id}` === value);
   return shop?.shop_name || value || "";
-}
-
-function formatTime(value) {
-  if (!value) return "";
-  return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }

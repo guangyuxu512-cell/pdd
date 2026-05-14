@@ -310,6 +310,9 @@ class ShunshouSignupRequest(SQLModel):
     platform: str = "taobao"
     pxi_min: float = 70
     sold_total_min: int = 3
+    product_id: str | None = None
+    joined_count_min: int | None = None
+    joined_count_max: int | None = None
     target_activity_count: int = 2
     custom_capacity_limit: int = 160
     reserve_item_count: int = 3
@@ -320,6 +323,30 @@ class ShunshouSignupRequest(SQLModel):
     max_wait_seconds: float = 1.8
     dry_run: bool = False
     assignments_by_activity: dict[str, list[str]] | None = None
+    remove_assignments_by_activity: dict[str, list[str]] | None = None
+
+
+class ShunshouSignupPriceChangeRequest(SQLModel):
+    shop_id: str
+    platform: str = "taobao"
+    product_ids: list[str] = []
+    assignments_by_activity: dict[str, list[str]] | None = None
+    cross_shop: bool = False
+    batch_size: int = 25
+    min_wait_seconds: float = 0.6
+    max_wait_seconds: float = 1.8
+    dry_run: bool = False
+
+
+class ShunshouSignupVerifyRequest(SQLModel):
+    shop_id: str
+    platform: str = "taobao"
+    assignments_by_activity: dict[str, list[str]] = {}
+    remove_assignments_by_activity: dict[str, list[str]] = {}
+    cross_shop: bool = False
+    batch_size: int = 25
+    min_wait_seconds: float = 0.3
+    max_wait_seconds: float = 0.6
 
 
 class ShunshouSyncResult(SQLModel):

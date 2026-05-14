@@ -2,6 +2,8 @@ import { api } from "../../api/client.js";
 import { el, formValue } from "../../core/dom.js";
 import { addLog, endTask, startTask } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
+import { renderImagePreview, renderThumbButton } from "../../components/media.js";
+import { formatTime, normalizeNumber } from "../../core/format.js";
 
 let selectedShop = "";
 let productIdQuery = "";
@@ -627,30 +629,11 @@ function shopLabel(value) {
 }
 
 function renderProductThumb(url) {
-  if (!url) return "";
-  return el("button", { class: "product-thumb-button", title: "查看主图", onclick: () => openImagePreview(url) }, [
-    el("img", {
-      class: "product-thumb",
-      src: url,
-      alt: "主图",
-      loading: "lazy",
-    }),
-    el("span", { class: "product-thumb-eye" }),
-  ]);
+  return renderThumbButton(url, { onOpen: openImagePreview });
 }
 
 function renderImagePreviewModal() {
-  return el("div", { class: previewImageUrl ? "modal-mask open" : "modal-mask", onclick: closeImagePreview }, [
-    el("div", { class: "image-preview-modal", onclick: (event) => event.stopPropagation() }, [
-      el("div", { class: "modal-header" }, [
-        el("strong", { text: "主图预览" }),
-        el("button", { class: "ghost", onclick: closeImagePreview }, ["关闭"]),
-      ]),
-      el("div", { class: "image-preview-body" }, [
-        previewImageUrl ? el("img", { class: "image-preview", src: previewImageUrl, alt: "主图预览" }) : "",
-      ]),
-    ]),
-  ]);
+  return renderImagePreview({ url: previewImageUrl, onClose: closeImagePreview });
 }
 
 function renderRelistModal() {
@@ -788,15 +771,4 @@ function relistPricePlanSummary(row) {
     .join(" / ");
   const moreText = skuPrices.length > 4 ? ` 等${skuPrices.length}个SKU` : "";
   return `计划一口价${formatPrice(itemPrice)}${skuText ? `，SKU价 ${skuText}${moreText}` : ""}`;
-}
-
-function normalizeNumber(value, fallback) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return number;
-}
-
-function formatTime(value) {
-  if (!value) return "";
-  return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }

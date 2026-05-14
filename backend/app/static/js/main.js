@@ -7,6 +7,7 @@ import { renderSkuPage } from "./modules/products/sku-page.js";
 import { renderSettingsPage } from "./modules/settings/settings-page.js";
 import { renderShunshouPage } from "./modules/shunshou/shunshou-page.js";
 import { renderShopPage } from "./modules/shops/shop-page.js";
+import { startAutoSync } from "./core/auto-sync.js";
 
 const renderers = {
   shops: renderShopPage,
@@ -31,6 +32,7 @@ renderMenu();
 renderTaskBanner();
 renderLogPanel();
 addLog("info", "前端已加载", "内置静态工作台");
+startAutoSync();
 
 async function renderActiveModule() {
   const container = document.getElementById("operation-area");

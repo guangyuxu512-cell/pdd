@@ -15,6 +15,8 @@ from app.models import (
     ShunshouActivityRead,
     ShunshouActivitySyncRequest,
     ShunshouSignupRequest,
+    ShunshouSignupPriceChangeRequest,
+    ShunshouSignupVerifyRequest,
     ShunshouSignupCheckResult,
     ShunshouSignupPreviewResult,
     ShunshouSignupResult,
@@ -131,6 +133,7 @@ def one_click_signup(data: ShunshouSignupRequest, session: SessionDep) -> dict:
         max_wait_seconds=data.max_wait_seconds,
         dry_run=data.dry_run,
         assignments_by_activity=data.assignments_by_activity,
+        remove_assignments_by_activity=data.remove_assignments_by_activity,
     )
 
 
@@ -141,6 +144,9 @@ def preview_signup(data: ShunshouSignupRequest, session: SessionDep) -> dict:
         shop=shop,
         pxi_min=data.pxi_min,
         sold_total_min=data.sold_total_min,
+        product_id=data.product_id,
+        joined_count_min=data.joined_count_min,
+        joined_count_max=data.joined_count_max,
         target_activity_count=data.target_activity_count,
         custom_capacity_limit=data.custom_capacity_limit,
         reserve_item_count=data.reserve_item_count,
@@ -154,8 +160,51 @@ def check_signup(data: ShunshouSignupRequest, session: SessionDep) -> dict:
     return ShunshouService(session).check_signup_assignments(
         shop=shop,
         assignments_by_activity=data.assignments_by_activity,
+        remove_assignments_by_activity=data.remove_assignments_by_activity,
         pxi_min=data.pxi_min,
         sold_total_min=data.sold_total_min,
+    )
+
+
+@router.post("/signup/price-changes/detect")
+def detect_signup_price_changes(data: ShunshouSignupPriceChangeRequest, session: SessionDep) -> dict:
+    shop = resolve_taobao_shop(session, data.platform, data.shop_id)
+    return ShunshouService(session).detect_signup_price_changes(
+        shop=shop,
+        product_ids=data.product_ids,
+        cross_shop=data.cross_shop,
+        batch_size=data.batch_size,
+        min_wait_seconds=data.min_wait_seconds,
+        max_wait_seconds=data.max_wait_seconds,
+    )
+
+
+@router.post("/signup/price-changes/update")
+def update_joined_signup_prices(data: ShunshouSignupPriceChangeRequest, session: SessionDep) -> dict:
+    shop = resolve_taobao_shop(session, data.platform, data.shop_id)
+    return ShunshouService(session).update_joined_signup_prices(
+        shop=shop,
+        product_ids=data.product_ids,
+        assignments_by_activity=data.assignments_by_activity,
+        cross_shop=data.cross_shop,
+        batch_size=data.batch_size,
+        min_wait_seconds=data.min_wait_seconds,
+        max_wait_seconds=data.max_wait_seconds,
+        dry_run=data.dry_run,
+    )
+
+
+@router.post("/signup/verify")
+def verify_signup(data: ShunshouSignupVerifyRequest, session: SessionDep) -> dict:
+    shop = resolve_taobao_shop(session, data.platform, data.shop_id)
+    return ShunshouService(session).verify_signup_assignments(
+        shop=shop,
+        assignments_by_activity=data.assignments_by_activity,
+        remove_assignments_by_activity=data.remove_assignments_by_activity,
+        cross_shop=data.cross_shop,
+        batch_size=data.batch_size,
+        min_wait_seconds=data.min_wait_seconds,
+        max_wait_seconds=data.max_wait_seconds,
     )
 
 

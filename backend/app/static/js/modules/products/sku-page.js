@@ -2,6 +2,8 @@ import { api } from "../../api/client.js";
 import { el, formValue } from "../../core/dom.js";
 import { addLog } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
+import { renderImagePreview, renderThumbButton } from "../../components/media.js";
+import { formatTime } from "../../core/format.js";
 
 let selectedShop = "";
 let skuCodeQuery = "";
@@ -182,25 +184,11 @@ function statusSelect() {
 }
 
 function renderThumb(url) {
-  if (!url) return "";
-  return el("button", { class: "product-thumb-button", title: "查看SKU主图", onclick: () => openImagePreview(url) }, [
-    el("img", { class: "product-thumb", src: url, alt: "SKU主图", loading: "lazy" }),
-    el("span", { class: "product-thumb-eye" }),
-  ]);
+  return renderThumbButton(url, { title: "查看SKU主图", alt: "SKU主图", onOpen: openImagePreview });
 }
 
 function renderImagePreviewModal() {
-  return el("div", { class: previewImageUrl ? "modal-mask open" : "modal-mask", onclick: closeImagePreview }, [
-    el("div", { class: "image-preview-modal", onclick: (event) => event.stopPropagation() }, [
-      el("div", { class: "modal-header" }, [
-        el("strong", { text: "SKU主图预览" }),
-        el("button", { class: "ghost", onclick: closeImagePreview }, ["关闭"]),
-      ]),
-      el("div", { class: "image-preview-body" }, [
-        previewImageUrl ? el("img", { class: "image-preview", src: previewImageUrl, alt: "SKU主图预览" }) : "",
-      ]),
-    ]),
-  ]);
+  return renderImagePreview({ url: previewImageUrl, title: "SKU主图预览", alt: "SKU主图预览", onClose: closeImagePreview });
 }
 
 async function openImagePreview(url) {
@@ -230,9 +218,4 @@ function statusLabel(status) {
 function formatNullablePrice(value) {
   if (value === null || value === undefined || value === "") return "";
   return Number(value).toFixed(2);
-}
-
-function formatTime(value) {
-  if (!value) return "";
-  return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }

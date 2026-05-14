@@ -319,7 +319,9 @@ def normalize_pxi_item(item: dict[str, Any]) -> dict[str, Any]:
 
 def format_update_date(value: str | None) -> str:
     if value is None or str(value).strip() == "":
-        return (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+        now = datetime.now()
+        days_back = 2 if now.hour < 9 else 1
+        return (now - timedelta(days=days_back)).strftime("%Y%m%d")
     digits = re.sub(r"\D", "", str(value).strip())
     if len(digits) != 8:
         raise HTTPException(status_code=400, detail="更新日期格式错误，请传 20260429 或 2026-04-29")

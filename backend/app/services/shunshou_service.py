@@ -1,9 +1,7 @@
 from __future__ import annotations
 
-import re
 import json
 import random
-import time
 import urllib.parse
 from datetime import datetime
 from typing import Any
@@ -23,6 +21,23 @@ from app.models import (
     ShunshouActivityItem,
     Shop,
 )
+from app.services.shunshou_utils import (
+    collect_product_rows,
+    collect_sku_rows,
+    default_user_agent,
+    is_auth_error,
+    is_submit_success,
+    normalize_activity,
+    normalize_activity_item,
+    normalize_assignments,
+    normalize_wait,
+    price_available,
+    price_text,
+    sleep_random,
+    text,
+    to_float,
+    to_int,
+)
 
 
 LIST_URL = "https://shell.mkt.taobao.com/taobaoTied/getList"
@@ -31,15 +46,6 @@ ITEM_URL = "https://shell.mkt.taobao.com/taobaoTied/getItemList"
 DETAIL_URL = "https://shell.mkt.taobao.com/taobaoTied/getDetailList"
 SUBMIT_URL = "https://shell.mkt.taobao.com/taobaoTied/addOrUpdateDetails"
 PAGE_SIZE = 20
-STATUS_MAP = {
-    0: "未知",
-    1: "未开始",
-    2: "进行中",
-    3: "已结束",
-    4: "已暂停",
-}
-
-
 class ShunshouService:
     def __init__(self, session: Session) -> None:
         self.session = session
@@ -121,6 +127,7 @@ class ShunshouService:
         max_wait_seconds: float = 1.8,
         dry_run: bool = False,
         assignments_by_activity: dict[str, list[str]] | None = None,
+        remove_assignments_by_activity: dict[str, list[str]] | None = None,
     ) -> dict[str, Any]:
         snapshot = self._latest_main_cookie(shop)
         cookie_dict = cookies_to_dict(snapshot.cookies_json)
@@ -140,6 +147,7 @@ class ShunshouService:
 
         base_items = self._eligible_signup_items(shop=shop, pxi_min=float(pxi_min), sold_total_min=int(sold_total_min))
         skipped_items: list[dict[str, Any]] = []
+        remove_assignments_by_activity = normalize_assignments(remove_assignments_by_activity or {})
         if assignments_by_activity is None:
             activity_map, item_activity_map = self._eligible_activity_map(shop=shop, base_items=base_items)
             assignments_by_activity, skipped_items = assign_items_to_activities(
@@ -156,34 +164,56 @@ class ShunshouService:
 
         execution_results: list[dict[str, Any]] = []
         submitted_sku_count = 0
-        for activity_id, product_ids in assignments_by_activity.items():
-            new_product_ids = list(dict.fromkeys(text(product_id) for product_id in product_ids if text(product_id)))
-            existing_product_ids = self._existing_signed_product_ids(shop=shop, activity_id=activity_id)
-            submit_product_ids = list(dict.fromkeys(existing_product_ids + new_product_ids))
-            sleep_random(wait_min, wait_max)
-            detail_rows = self._fetch_sku_detail_rows(
+        activity_ids = list(dict.fromkeys([*assignments_by_activity.keys(), *remove_assignments_by_activity.keys()]))
+        for activity_id in activity_ids:
+            product_ids = assignments_by_activity.get(activity_id, [])
+            remove_product_ids = set(remove_assignments_by_activity.get(activity_id, []))
+            requested_product_ids = list(dict.fromkeys(text(product_id) for product_id in product_ids if text(product_id)))
+            self._refresh_activity_item_snapshot(
+                shop=shop,
                 cookie_dict=cookie_dict,
                 xsrf_token=xsrf_token,
                 user_agent=user_agent,
                 activity_id=activity_id,
-                product_ids=submit_product_ids,
                 cross_shop=cross_shop,
-                batch_size=batch_size,
-                wait_min=wait_min,
-                wait_max=wait_max,
+                auction_status=0,
             )
+            existing_product_ids = self._existing_signed_product_ids(shop=shop, activity_id=activity_id)
+            submit_product_ids = [
+                product_id
+                for product_id in list(dict.fromkeys(existing_product_ids + requested_product_ids))
+                if product_id not in remove_product_ids
+            ]
+            new_product_ids = [product_id for product_id in requested_product_ids if product_id not in existing_product_ids]
+            preserved_product_ids = [product_id for product_id in existing_product_ids if product_id in submit_product_ids]
+            removed_product_ids = [product_id for product_id in existing_product_ids if product_id in remove_product_ids]
+            sleep_random(wait_min, wait_max)
+            detail_rows = []
+            if submit_product_ids:
+                detail_rows = self._fetch_sku_detail_rows(
+                    cookie_dict=cookie_dict,
+                    xsrf_token=xsrf_token,
+                    user_agent=user_agent,
+                    activity_id=activity_id,
+                    product_ids=submit_product_ids,
+                    cross_shop=cross_shop,
+                    batch_size=batch_size,
+                    wait_min=wait_min,
+                    wait_max=wait_max,
+                )
             params, skipped, param_stats = self._build_submit_params(
                 shop=shop,
                 detail_rows=detail_rows,
                 new_product_ids=set(new_product_ids),
-                preserve_product_ids=set(existing_product_ids),
+                preserve_product_ids=set(preserved_product_ids),
             )
             skipped_items.extend(skipped)
             result_row: dict[str, Any] = {
                 "activity_id": activity_id,
-                "item_count": len(new_product_ids),
+                "item_count": len(requested_product_ids),
                 "new_item_count": len(new_product_ids),
-                "preserved_item_count": len(existing_product_ids),
+                "preserved_item_count": len(preserved_product_ids),
+                "removed_item_count": len(removed_product_ids),
                 "submit_item_count": len(submit_product_ids),
                 "detail_count": len(detail_rows),
                 "params_count": len(params),
@@ -191,14 +221,35 @@ class ShunshouService:
                 "preserved_params_count": param_stats["preserved_params_count"],
                 "ignored_sku_count": param_stats["ignored_sku_count"],
                 "ignored_product_ids": param_stats["ignored_product_ids"],
+                "param_product_ids": param_stats["submitted_product_ids"],
+                "submitted_product_ids": [],
+                "failed_product_ids": param_stats["failed_product_ids"],
                 "submitted": False,
+                "submit_success": False,
             }
             if dry_run:
                 result_row["dry_run"] = True
                 execution_results.append(result_row)
                 continue
-            if not params:
+            if not params and submit_product_ids:
                 result_row["error"] = "params_count=0"
+                result_row["invalid_params"] = [
+                    {"product_id": product_id, "sku_id": "", "reason": "本次需要提交商品，但没有任何可提交SKU参数"}
+                    for product_id in requested_product_ids
+                ][:20]
+                execution_results.append(result_row)
+                continue
+            invalid_params = self._validate_submit_params(
+                params,
+                required_new_product_ids=set(new_product_ids),
+                allowed_product_ids=set(submit_product_ids),
+            )
+            if invalid_params:
+                result_row["error"] = "提交参数本地校验失败"
+                result_row["invalid_params"] = invalid_params[:20]
+                failed_product_ids = set(result_row.get("failed_product_ids") or [])
+                failed_product_ids.update(text(row.get("product_id")) for row in invalid_params if text(row.get("product_id")))
+                result_row["failed_product_ids"] = sorted(failed_product_ids)
                 execution_results.append(result_row)
                 continue
             sleep_random(wait_min, wait_max)
@@ -213,14 +264,22 @@ class ShunshouService:
             result_row["submitted"] = True
             result_row["result"] = submit_result
             if is_submit_success(submit_result):
+                result_row["submit_success"] = True
+                result_row["submitted_product_ids"] = param_stats["submitted_product_ids"]
                 submitted_sku_count += param_stats["new_params_count"]
                 self._mark_signup_success(
                     shop=shop,
                     activity_id=activity_id,
                     params=params,
                     submit_result=submit_result,
-                    product_ids=new_product_ids,
+                    product_ids=param_stats["submitted_product_ids"],
+                    removed_product_ids=removed_product_ids,
                 )
+            else:
+                result_row["error"] = submit_error_message(submit_result)
+                failed_product_ids = set(result_row.get("failed_product_ids") or [])
+                failed_product_ids.update(param_stats["submitted_product_ids"])
+                result_row["failed_product_ids"] = sorted(failed_product_ids)
             execution_results.append(result_row)
 
         return {
@@ -228,11 +287,12 @@ class ShunshouService:
             "shop_id": shop.shop_id,
             "candidate_count": len(base_items),
             "assignment_count": sum(len(values) for values in assignments_by_activity.values()),
-            "submitted_activity_count": sum(1 for row in execution_results if row.get("submitted")),
+            "submitted_activity_count": sum(1 for row in execution_results if row.get("submit_success")),
             "submitted_sku_count": submitted_sku_count,
             "skipped_count": len(skipped_items),
             "dry_run": bool(dry_run),
             "assignments_by_activity": assignments_by_activity,
+            "remove_assignments_by_activity": remove_assignments_by_activity,
             "execution_results": execution_results,
             "skipped_items": skipped_items,
         }
@@ -243,63 +303,74 @@ class ShunshouService:
         shop: Shop,
         pxi_min: float = 70,
         sold_total_min: int = 3,
+        product_id: str | None = None,
+        joined_count_min: int | None = None,
+        joined_count_max: int | None = None,
         target_activity_count: int = 2,
         custom_capacity_limit: int = 160,
         reserve_item_count: int = 3,
         real_capacity_fallback: int = 171,
     ) -> dict[str, Any]:
-        target_activity_count = max(1, int(target_activity_count or 1))
-        custom_capacity_limit = max(1, min(171, int(custom_capacity_limit or 160)))
-        reserve_item_count = max(0, int(reserve_item_count or 0))
-        real_capacity_fallback = max(1, int(real_capacity_fallback or 171))
-        base_items = self._eligible_signup_items(shop=shop, pxi_min=float(pxi_min), sold_total_min=int(sold_total_min))
-        activity_map, item_activity_map = self._eligible_activity_map(shop=shop, base_items=base_items)
-        assignments_by_activity, skipped_items = assign_items_to_activities(
-            base_items=base_items,
-            activity_map=activity_map,
-            item_activity_map=item_activity_map,
-            target_activity_count=target_activity_count,
-            custom_capacity_limit=custom_capacity_limit,
-            reserve_item_count=reserve_item_count,
-            real_capacity_fallback=real_capacity_fallback,
+        base_items = self._eligible_signup_items(
+            shop=shop,
+            pxi_min=float(pxi_min),
+            sold_total_min=int(sold_total_min),
+            product_id=product_id,
+            joined_count_min=joined_count_min,
+            joined_count_max=joined_count_max,
         )
+        activity_map, item_activity_map = self._selectable_activity_map(shop=shop, base_items=base_items)
+        skipped_items: list[dict[str, Any]] = []
+        assignments_by_activity: dict[str, list[str]] = {}
         product_map = {item["product_id"]: item for item in base_items}
         rows_by_product: dict[str, dict[str, Any]] = {}
-        for activity_id, product_ids in assignments_by_activity.items():
-            activity = activity_map.get(activity_id) or {}
-            for product_id in product_ids:
-                product = product_map.get(product_id) or {}
-                if product_id not in rows_by_product:
-                    rows_by_product[product_id] = {
-                        "product_id": product_id,
-                        "title": product.get("title", ""),
-                        "image_url": product.get("image_url", ""),
-                        "pxi_score": product.get("pxi_score"),
-                        "total_sales": product.get("total_sales"),
-                        "joined_count": product.get("joined_count", 0),
-                        "signup_price_min": product.get("signup_price_min"),
-                        "signup_price_max": product.get("signup_price_max"),
-                        "priced_sku_count": product.get("priced_sku_count", 0),
-                        "normal_price_min": product.get("normal_price_min"),
-                        "normal_price_max": product.get("normal_price_max"),
-                        "current_price_min": product.get("current_price_min"),
-                        "current_price_max": product.get("current_price_max"),
-                        "current_item_price": product.get("current_item_price"),
-                        "expected_item_price": product.get("expected_item_price"),
-                        "item_price_mismatch": product.get("item_price_mismatch", False),
-                        "price_mismatch_count": product.get("price_mismatch_count", 0),
-                        "missing_normal_price_count": product.get("missing_normal_price_count", 0),
-                        "price_status": product.get("price_status", ""),
-                        "activities": [],
-                    }
+        for product_id, activity_keys in item_activity_map.items():
+            product = product_map.get(product_id) or {}
+            if product_id not in rows_by_product:
+                rows_by_product[product_id] = {
+                    "product_id": product_id,
+                    "title": product.get("title", ""),
+                    "image_url": product.get("image_url", ""),
+                    "pxi_score": product.get("pxi_score"),
+                    "total_sales": product.get("total_sales"),
+                    "joined_count": product.get("joined_count", 0),
+                    "signup_price_min": product.get("signup_price_min"),
+                    "signup_price_max": product.get("signup_price_max"),
+                    "priced_sku_count": product.get("priced_sku_count", 0),
+                    "normal_price_min": product.get("normal_price_min"),
+                    "normal_price_max": product.get("normal_price_max"),
+                    "current_price_min": product.get("current_price_min"),
+                    "current_price_max": product.get("current_price_max"),
+                    "current_item_price": product.get("current_item_price"),
+                    "expected_item_price": product.get("expected_item_price"),
+                    "item_price_mismatch": product.get("item_price_mismatch", False),
+                    "price_mismatch_count": product.get("price_mismatch_count", 0),
+                    "missing_normal_price_count": product.get("missing_normal_price_count", 0),
+                    "price_status": product.get("price_status", ""),
+                    "activities": [],
+                }
+            for activity_key in activity_keys:
+                activity = activity_map.get(activity_key) or {}
+                activity_id = activity.get("activity_id", "")
+                if activity.get("is_joined"):
+                    assignments_by_activity.setdefault(activity_id, []).append(product_id)
                 rows_by_product[product_id]["activities"].append(
                     {
                         "activity_id": activity_id,
                         "activity_name": activity.get("activity_name", ""),
-                        "selected": True,
+                        "selected": bool(activity.get("is_joined")),
+                        "is_joined": int(activity.get("is_joined") or 0),
+                        "activity_item_status": activity.get("activity_item_status", ""),
+                        "warn_message": activity.get("warn_message", ""),
                     }
                 )
+        for item in base_items:
+            product_id = item["product_id"]
+            if product_id in rows_by_product:
+                continue
+            skipped_items.append({"product_id": product_id, "title": item.get("title", ""), "reason": "没有可报名或已报名活动"})
         rows = list(rows_by_product.values())
+        rows.sort(key=lambda row: row["product_id"])
         return {
             "platform": shop.platform,
             "shop_id": shop.shop_id,
@@ -315,10 +386,12 @@ class ShunshouService:
         *,
         shop: Shop,
         assignments_by_activity: dict[str, list[str]] | None,
+        remove_assignments_by_activity: dict[str, list[str]] | None = None,
         pxi_min: float = 70,
         sold_total_min: int = 3,
     ) -> dict[str, Any]:
         assignments = normalize_assignments(assignments_by_activity or {})
+        removals = normalize_assignments(remove_assignments_by_activity or {})
         rows: list[dict[str, Any]] = []
         failed_rows: list[dict[str, Any]] = []
 
@@ -334,6 +407,12 @@ class ShunshouService:
                 rows.append(row)
                 if not row["ok"]:
                     failed_rows.append(row)
+        for activity_id, product_ids in removals.items():
+            for product_id in product_ids:
+                row = self._check_signup_removal(shop=shop, activity_id=activity_id, product_id=product_id)
+                rows.append(row)
+                if not row["ok"]:
+                    failed_rows.append(row)
 
         return {
             "platform": shop.platform,
@@ -344,6 +423,265 @@ class ShunshouService:
             "ok": not failed_rows,
             "rows": rows,
             "failed_rows": failed_rows,
+        }
+
+    def detect_signup_price_changes(
+        self,
+        *,
+        shop: Shop,
+        product_ids: list[str],
+        cross_shop: bool = False,
+        batch_size: int = 25,
+        min_wait_seconds: float = 0.6,
+        max_wait_seconds: float = 1.8,
+    ) -> dict[str, Any]:
+        cookie_dict, xsrf_token, user_agent = self._request_context(shop=shop, action="检测报名价变动")
+        product_ids = normalize_product_ids(product_ids)
+        batch_size = max(1, int(batch_size or 25))
+        wait_min, wait_max = normalize_wait(min_wait_seconds, max_wait_seconds)
+        activity_products = self._joined_activity_products(shop=shop, product_ids=product_ids)
+        rows: list[dict[str, Any]] = []
+        for activity_id, ids in activity_products.items():
+            detail_rows = self._fetch_sku_detail_rows(
+                cookie_dict=cookie_dict,
+                xsrf_token=xsrf_token,
+                user_agent=user_agent,
+                activity_id=activity_id,
+                product_ids=ids,
+                cross_shop=cross_shop,
+                batch_size=batch_size,
+                wait_min=wait_min,
+                wait_max=wait_max,
+            )
+            rows.extend(self._build_price_change_rows(shop=shop, activity_id=activity_id, detail_rows=detail_rows))
+        changed_rows = [row for row in rows if row.get("changed")]
+        return {
+            "platform": shop.platform,
+            "shop_id": shop.shop_id,
+            "requested_product_count": len(product_ids),
+            "joined_product_count": len({product_id for ids in activity_products.values() for product_id in ids}),
+            "activity_count": len(activity_products),
+            "sku_count": len(rows),
+            "changed_count": len(changed_rows),
+            "can_update_count": sum(1 for row in changed_rows if row.get("can_update")),
+            "rows": rows,
+        }
+
+    def update_joined_signup_prices(
+        self,
+        *,
+        shop: Shop,
+        product_ids: list[str],
+        assignments_by_activity: dict[str, list[str]] | None = None,
+        cross_shop: bool = False,
+        batch_size: int = 25,
+        min_wait_seconds: float = 0.6,
+        max_wait_seconds: float = 1.8,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        cookie_dict, xsrf_token, user_agent = self._request_context(shop=shop, action="更新已报名价格")
+        product_ids = normalize_product_ids(product_ids)
+        assignments = normalize_assignments(assignments_by_activity or {})
+        if assignments:
+            product_ids = normalize_product_ids([product_id for ids in assignments.values() for product_id in ids])
+        if not product_ids:
+            raise HTTPException(status_code=400, detail="请先勾选要更新已报名价格的商品")
+        batch_size = max(1, int(batch_size or 25))
+        wait_min, wait_max = normalize_wait(min_wait_seconds, max_wait_seconds)
+        activity_products = assignments or self._joined_activity_products(shop=shop, product_ids=product_ids)
+        execution_results: list[dict[str, Any]] = []
+        skipped_items: list[dict[str, Any]] = []
+        updated_sku_count = 0
+        for activity_id, target_product_ids in activity_products.items():
+            self._refresh_activity_item_snapshot(
+                shop=shop,
+                cookie_dict=cookie_dict,
+                xsrf_token=xsrf_token,
+                user_agent=user_agent,
+                activity_id=activity_id,
+                cross_shop=cross_shop,
+                auction_status=0,
+            )
+            existing_product_ids = self._existing_signed_product_ids(shop=shop, activity_id=activity_id)
+            if not existing_product_ids:
+                execution_results.append({"activity_id": activity_id, "submitted": False, "error": "没有已报名商品"})
+                continue
+            detail_rows = self._fetch_sku_detail_rows(
+                cookie_dict=cookie_dict,
+                xsrf_token=xsrf_token,
+                user_agent=user_agent,
+                activity_id=activity_id,
+                product_ids=existing_product_ids,
+                cross_shop=cross_shop,
+                batch_size=batch_size,
+                wait_min=wait_min,
+                wait_max=wait_max,
+            )
+            params, skipped, stats = self._build_update_price_params(
+                shop=shop,
+                detail_rows=detail_rows,
+                update_product_ids=set(target_product_ids),
+            )
+            skipped_items.extend(skipped)
+            result_row: dict[str, Any] = {
+                "activity_id": activity_id,
+                "target_item_count": len(target_product_ids),
+                "preserved_item_count": max(0, len(existing_product_ids) - len(target_product_ids)),
+                "submit_item_count": len(existing_product_ids),
+                "detail_count": len(detail_rows),
+                "params_count": len(params),
+                "updated_params_count": stats["updated_params_count"],
+                "preserved_params_count": stats["preserved_params_count"],
+                "unchanged_params_count": stats["unchanged_params_count"],
+                "submitted": False,
+            }
+            if dry_run:
+                result_row["dry_run"] = True
+                execution_results.append(result_row)
+                continue
+            if not params:
+                result_row["error"] = "params_count=0"
+                execution_results.append(result_row)
+                continue
+            invalid_params = self._validate_submit_params(params, allowed_product_ids=set(existing_product_ids))
+            if invalid_params:
+                result_row["error"] = "提交参数本地校验失败"
+                result_row["invalid_params"] = invalid_params[:20]
+                execution_results.append(result_row)
+                continue
+            sleep_random(wait_min, wait_max)
+            submit_result = self._submit_signup(
+                cookie_dict=cookie_dict,
+                xsrf_token=xsrf_token,
+                user_agent=user_agent,
+                activity_id=activity_id,
+                params=params,
+                cross_shop=cross_shop,
+            )
+            result_row["submitted"] = True
+            result_row["result"] = submit_result
+            if is_submit_success(submit_result):
+                updated_sku_count += stats["updated_params_count"]
+                self._mark_signup_price_update(
+                    shop=shop,
+                    activity_id=activity_id,
+                    product_ids=target_product_ids,
+                    submit_result=submit_result,
+                    updated_params_count=stats["updated_params_count"],
+                )
+            else:
+                result_row["error"] = submit_error_message(submit_result)
+            execution_results.append(result_row)
+        return {
+            "platform": shop.platform,
+            "shop_id": shop.shop_id,
+            "requested_product_count": len(product_ids),
+            "activity_count": len(activity_products),
+            "submitted_activity_count": sum(1 for row in execution_results if row.get("submitted") and not row.get("error")),
+            "updated_sku_count": updated_sku_count,
+            "skipped_count": len(skipped_items),
+            "dry_run": bool(dry_run),
+            "execution_results": execution_results,
+            "skipped_items": skipped_items,
+        }
+
+    def verify_signup_assignments(
+        self,
+        *,
+        shop: Shop,
+        assignments_by_activity: dict[str, list[str]],
+        remove_assignments_by_activity: dict[str, list[str]] | None = None,
+        cross_shop: bool = False,
+        batch_size: int = 25,
+        min_wait_seconds: float = 0.3,
+        max_wait_seconds: float = 0.6,
+    ) -> dict[str, Any]:
+        cookie_dict, xsrf_token, user_agent = self._request_context(shop=shop, action="复查报名结果")
+        assignments = normalize_assignments(assignments_by_activity or {})
+        removals = normalize_assignments(remove_assignments_by_activity or {})
+        batch_size = max(1, int(batch_size or 25))
+        wait_min, wait_max = normalize_wait(min_wait_seconds, max_wait_seconds)
+        rows: list[dict[str, Any]] = []
+        failed_rows: list[dict[str, Any]] = []
+        activity_ids = list(dict.fromkeys([*assignments.keys(), *removals.keys()]))
+        for activity_id in activity_ids:
+            expected_joined = assignments.get(activity_id, [])
+            expected_removed = removals.get(activity_id, [])
+            verify_product_ids = list(dict.fromkeys([*expected_joined, *expected_removed]))
+            detail_rows = self._fetch_sku_detail_rows(
+                cookie_dict=cookie_dict,
+                xsrf_token=xsrf_token,
+                user_agent=user_agent,
+                activity_id=activity_id,
+                product_ids=verify_product_ids,
+                cross_shop=cross_shop,
+                batch_size=batch_size,
+                wait_min=wait_min,
+                wait_max=wait_max,
+            ) if verify_product_ids else []
+            detail_product_ids = {text(row.get("itemId")) for row in detail_rows if text(row.get("itemId"))}
+            for product_id in expected_joined:
+                ok = product_id in detail_product_ids
+                row = {
+                    "activity_id": activity_id,
+                    "product_id": product_id,
+                    "action": "add",
+                    "ok": ok,
+                    "reason": "SKU明细仍可读取，确认在活动编辑清单" if ok else "SKU明细接口未返回该商品，未确认已报名",
+                    "sku_count": sum(1 for detail in detail_rows if text(detail.get("itemId")) == product_id),
+                }
+                rows.append(row)
+                if not ok:
+                    failed_rows.append(row)
+            for product_id in expected_removed:
+                ok = product_id not in detail_product_ids
+                row = {
+                    "activity_id": activity_id,
+                    "product_id": product_id,
+                    "action": "remove",
+                    "ok": ok,
+                    "reason": "SKU明细不再返回该商品，确认已取消" if ok else "SKU明细仍返回该商品，未确认取消",
+                    "sku_count": sum(1 for detail in detail_rows if text(detail.get("itemId")) == product_id),
+                }
+                rows.append(row)
+                if not ok:
+                    failed_rows.append(row)
+        return {
+            "platform": shop.platform,
+            "shop_id": shop.shop_id,
+            "checked_count": len(rows),
+            "passed_count": len(rows) - len(failed_rows),
+            "failed_count": len(failed_rows),
+            "ok": not failed_rows,
+            "rows": rows,
+            "failed_rows": failed_rows,
+        }
+
+    def _check_signup_removal(self, *, shop: Shop, activity_id: str, product_id: str) -> dict[str, Any]:
+        reasons: list[str] = []
+        item = self.session.exec(
+            select(ShunshouActivityItem).where(
+                ShunshouActivityItem.platform == shop.platform,
+                ShunshouActivityItem.shop_id == shop.shop_id,
+                ShunshouActivityItem.activity_id == activity_id,
+                ShunshouActivityItem.product_id == product_id,
+            )
+        ).first()
+        if not item:
+            reasons.append("活动商品快照没有这条商品，无法取消报名")
+        else:
+            if item.sync_status != "active":
+                reasons.append(f"活动商品快照不是有效，当前={item.sync_status or '-'}")
+            if int(item.is_joined or 0) != 1:
+                reasons.append("当前本地状态不是已报名，无需取消")
+        return {
+            "activity_id": activity_id,
+            "product_id": product_id,
+            "action": "remove",
+            "ok": not reasons,
+            "reason": "；".join(reasons) if reasons else "通过",
+            "activity_item_status": item.activity_item_status if item else None,
+            "is_joined": item.is_joined if item else None,
         }
 
     def _check_signup_assignment(
@@ -464,7 +802,8 @@ class ShunshouService:
             )
         ).first()
         if not activity_item:
-            reasons.append("活动商品快照没有这条商品，请先获取活动商品")
+            details["activity_item_status"] = "未同步"
+            details["activity_item_sync_status"] = "missing"
         else:
             details.update(
                 {
@@ -477,12 +816,12 @@ class ShunshouService:
             )
             if activity_item.sync_status != "active":
                 reasons.append(f"活动商品快照不是有效，当前={activity_item.sync_status or '-'}")
-            if activity_item.warn_status != "null":
+            if int(activity_item.is_joined or 0) == 1:
+                details["already_joined"] = True
+            elif activity_item.warn_status != "null":
                 reasons.append(f"活动商品有提示：{activity_item.warn_message or activity_item.warn_status or '-'}")
-            if activity_item.activity_item_status != "可报名":
+            elif activity_item.activity_item_status != "可报名":
                 reasons.append(f"活动商品状态不是可报名，当前={activity_item.activity_item_status or '-'}")
-            if int(activity_item.is_joined or 0) != 0:
-                reasons.append("活动商品已报名，不需要重复报名")
 
         return {
             "activity_id": activity_id,
@@ -503,7 +842,26 @@ class ShunshouService:
             raise HTTPException(status_code=400, detail="没有可用的淘宝主 cookie，请先网页登录并保存登录态")
         return snapshot
 
-    def _eligible_signup_items(self, *, shop: Shop, pxi_min: float, sold_total_min: int) -> list[dict[str, Any]]:
+    def _request_context(self, *, shop: Shop, action: str) -> tuple[dict[str, str], str, str | None]:
+        snapshot = self._latest_main_cookie(shop)
+        cookie_dict = cookies_to_dict(snapshot.cookies_json)
+        cookie_header = snapshot.cookie_header_text or build_cookie_header(snapshot.cookies_json)
+        cookie_dict["__cookie_header"] = cookie_header
+        xsrf_token = extract_cookie_value_from_header(cookie_header, "XSRF-TOKEN") or cookie_dict.get("XSRF-TOKEN")
+        if not xsrf_token:
+            raise HTTPException(status_code=400, detail=f"cookie 中未找到 XSRF-TOKEN，请重新登录店铺后再{action}")
+        return cookie_dict, xsrf_token, self._user_agent(shop, snapshot)
+
+    def _eligible_signup_items(
+        self,
+        *,
+        shop: Shop,
+        pxi_min: float,
+        sold_total_min: int,
+        product_id: str | None = None,
+        joined_count_min: int | None = None,
+        joined_count_max: int | None = None,
+    ) -> list[dict[str, Any]]:
         statement = (
             select(Product, ProductPxi)
             .join(
@@ -518,6 +876,9 @@ class ShunshouService:
             .where(Product.total_sales >= sold_total_min)
             .where(ProductPxi.status == "active")
         )
+        product_id_text = text(product_id)
+        if product_id_text:
+            statement = statement.where(Product.product_id == product_id_text)
         rows = []
         for product, pxi in self.session.exec(statement).all():
             pxi_score = to_float(pxi.pxi_score) or 0.0
@@ -578,6 +939,11 @@ class ShunshouService:
                     ShunshouActivityItem.is_joined == 1,
                 )
             ).all()
+            joined_total = len(joined_count)
+            if joined_count_min is not None and joined_total < int(joined_count_min):
+                continue
+            if joined_count_max is not None and joined_total > int(joined_count_max):
+                continue
             rows.append(
                 {
                     "product_id": product.product_id,
@@ -585,7 +951,7 @@ class ShunshouService:
                     "image_url": product.main_image_url or "",
                     "total_sales": product.total_sales,
                     "pxi_score": pxi_score,
-                    "joined_count": len(joined_count),
+                    "joined_count": joined_total,
                     "signup_price_min": min(price_values),
                     "signup_price_max": max(price_values),
                     "priced_sku_count": len(price_values),
@@ -634,15 +1000,67 @@ class ShunshouService:
         activity_map: dict[str, dict[str, Any]] = {}
         item_activity_map: dict[str, list[str]] = {}
         for item, activity in self.session.exec(statement).all():
-            activity_map[activity.activity_id] = {
+            activity_key = f"{item.product_id}::{activity.activity_id}"
+            activity_map[activity_key] = {
                 "activity_id": activity.activity_id,
                 "activity_name": activity.activity_name or "",
                 "signed_item_count": activity.signed_item_count,
                 "max_item_limit": activity.max_item_limit,
             }
             item_activity_map.setdefault(item.product_id, [])
-            if activity.activity_id not in item_activity_map[item.product_id]:
-                item_activity_map[item.product_id].append(activity.activity_id)
+            if activity_key not in item_activity_map[item.product_id]:
+                item_activity_map[item.product_id].append(activity_key)
+        return activity_map, item_activity_map
+
+    def _selectable_activity_map(
+        self,
+        *,
+        shop: Shop,
+        base_items: list[dict[str, Any]],
+    ) -> tuple[dict[str, dict[str, Any]], dict[str, list[str]]]:
+        product_ids = [item["product_id"] for item in base_items]
+        if not product_ids:
+            return {}, {}
+        activities = self.session.exec(
+            select(ShunshouActivity)
+            .where(ShunshouActivity.platform == shop.platform)
+            .where(ShunshouActivity.shop_id == shop.shop_id)
+            .where(ShunshouActivity.sync_status == "active")
+            .where(ShunshouActivity.activity_status_text == "进行中")
+            .order_by(ShunshouActivity.updated_at.desc())
+        ).all()
+        if not activities:
+            return {}, {}
+        item_rows = self.session.exec(
+            select(ShunshouActivityItem)
+            .where(ShunshouActivityItem.platform == shop.platform)
+            .where(ShunshouActivityItem.shop_id == shop.shop_id)
+            .where(ShunshouActivityItem.product_id.in_(product_ids))
+            .where(ShunshouActivityItem.sync_status == "active")
+        ).all()
+        item_status = {
+            (item.product_id, item.activity_id): item
+            for item in item_rows
+        }
+        activity_map: dict[str, dict[str, Any]] = {}
+        item_activity_map: dict[str, list[str]] = {}
+        for product_id in product_ids:
+            item_activity_map.setdefault(product_id, [])
+            for activity in activities:
+                item = item_status.get((product_id, activity.activity_id))
+                is_joined = int(item.is_joined or 0) if item else 0
+                activity_key = f"{product_id}::{activity.activity_id}"
+                activity_map[activity_key] = {
+                    "activity_id": activity.activity_id,
+                    "activity_name": activity.activity_name or "",
+                    "signed_item_count": activity.signed_item_count,
+                    "max_item_limit": activity.max_item_limit,
+                    "is_joined": is_joined,
+                    "activity_item_status": item.activity_item_status if item else "未同步",
+                    "warn_message": item.warn_message if item else "",
+                    "has_activity_item_snapshot": bool(item),
+                }
+                item_activity_map[product_id].append(activity_key)
         return activity_map, item_activity_map
 
     def _fetch_sku_detail_rows(
@@ -710,6 +1128,93 @@ class ShunshouService:
         ).all()
         return list(dict.fromkeys(text(product_id) for product_id in rows if text(product_id)))
 
+    def _joined_activity_products(self, *, shop: Shop, product_ids: list[str]) -> dict[str, list[str]]:
+        statement = select(ShunshouActivityItem).where(
+            ShunshouActivityItem.platform == shop.platform,
+            ShunshouActivityItem.shop_id == shop.shop_id,
+            ShunshouActivityItem.sync_status == "active",
+            ShunshouActivityItem.is_joined == 1,
+        )
+        if product_ids:
+            statement = statement.where(ShunshouActivityItem.product_id.in_(product_ids))
+        rows = self.session.exec(statement).all()
+        grouped: dict[str, list[str]] = {}
+        for row in rows:
+            grouped.setdefault(row.activity_id, [])
+            if row.product_id not in grouped[row.activity_id]:
+                grouped[row.activity_id].append(row.product_id)
+        return grouped
+
+    def _build_price_change_rows(
+        self,
+        *,
+        shop: Shop,
+        activity_id: str,
+        detail_rows: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        activity = self.session.exec(
+            select(ShunshouActivity).where(
+                ShunshouActivity.platform == shop.platform,
+                ShunshouActivity.shop_id == shop.shop_id,
+                ShunshouActivity.activity_id == activity_id,
+            )
+        ).first()
+        product_ids = list(dict.fromkeys(text(row.get("itemId")) for row in detail_rows if text(row.get("itemId"))))
+        products_by_id: dict[str, Product] = {}
+        if product_ids:
+            products = self.session.exec(
+                select(Product).where(
+                    Product.platform == shop.platform,
+                    Product.shop_id == shop.shop_id,
+                    Product.product_id.in_(product_ids),
+                )
+            ).all()
+            products_by_id = {product.product_id: product for product in products}
+        rows: list[dict[str, Any]] = []
+        for row in detail_rows:
+            product_id = text(row.get("itemId"))
+            sku_id = text(row.get("skuId"))
+            product = products_by_id.get(product_id)
+            sku = self.session.exec(
+                select(ProductSku).where(
+                    ProductSku.platform == shop.platform,
+                    ProductSku.shop_id == shop.shop_id,
+                    ProductSku.product_id == product_id,
+                    ProductSku.sku_id == sku_id,
+                    ProductSku.status == "active",
+                )
+            ).first()
+            current_price = activity_signup_price(row)
+            feishu_price = float(sku.shunshou_signup_price) if sku and sku.shunshou_signup_price is not None else None
+            changed = current_price is not None and feishu_price is not None and abs(current_price - feishu_price) >= 0.01
+            reason = ""
+            if not sku:
+                reason = "本地没有有效SKU"
+            elif feishu_price is None:
+                reason = "SKU没有顺手报名价"
+            elif current_price is None:
+                reason = "活动接口未返回当前报名价"
+            elif not changed:
+                reason = "价格未变化"
+            rows.append(
+                {
+                    "activity_id": activity_id,
+                    "activity_name": activity.activity_name if activity else "",
+                    "product_id": product_id,
+                    "title": product.title if product else text(row.get("itemTitle") or row.get("title")),
+                    "image_url": (product.main_image_url if product else None) or (sku.image_url if sku else ""),
+                    "sku_id": sku_id,
+                    "sku_code": sku.sku_code if sku else "",
+                    "sku_name": sku.sku_name if sku else text(row.get("skuName") or row.get("skuTitle")),
+                    "current_signup_price": current_price,
+                    "feishu_signup_price": feishu_price,
+                    "changed": changed,
+                    "can_update": changed and bool(sku and feishu_price is not None),
+                    "reason": reason,
+                }
+            )
+        return rows
+
     def _build_submit_params(
         self,
         *,
@@ -725,9 +1230,13 @@ class ShunshouService:
             "preserved_params_count": 0,
             "ignored_sku_count": 0,
             "ignored_product_ids": [],
+            "submitted_product_ids": [],
+            "failed_product_ids": [],
         }
         new_products_with_params: set[str] = set()
         ignored_products: set[str] = set()
+        skipped_products: set[str] = set()
+        detail_products: set[str] = set()
         for row in detail_rows:
             product_id = text(row.get("itemId"))
             sku_id = text(row.get("skuId"))
@@ -735,17 +1244,57 @@ class ShunshouService:
             is_preserve = product_id in preserve_product_ids
             if not is_new and not is_preserve:
                 continue
+            if product_id:
+                detail_products.add(product_id)
 
             if is_preserve and not is_new:
                 new_row = dict(row)
                 new_row["checked"] = True
+                editable = text(new_row.get("editable", 1))
                 promotion_price = to_float(new_row.get("promotionPrice"))
                 promotion_price_cent = to_int(new_row.get("promotionPriceCent"))
                 if promotion_price is None and promotion_price_cent is not None:
                     promotion_price = promotion_price_cent / 100
+                if promotion_price is None and editable not in ("0", "false", "False"):
+                    sku = self.session.exec(
+                        select(ProductSku).where(
+                            ProductSku.platform == shop.platform,
+                            ProductSku.shop_id == shop.shop_id,
+                            ProductSku.product_id == product_id,
+                            ProductSku.sku_id == sku_id,
+                            ProductSku.status == "active",
+                        )
+                    ).first()
+                    if sku and sku.shunshou_signup_price is not None:
+                        ok, reason = price_available(row, float(sku.shunshou_signup_price))
+                        if ok:
+                            promotion_price = float(sku.shunshou_signup_price)
+                        else:
+                            skipped.append({
+                                "product_id": product_id,
+                                "sku_id": sku_id,
+                                "reason": f"保留已报名SKU补齐报名价失败：{reason}",
+                                "editable": editable,
+                                "sku_code": sku.sku_code or "",
+                                "sku_name": sku.sku_name or text(row.get("skuName") or row.get("skuTitle")),
+                                "signup_price": float(sku.shunshou_signup_price),
+                            })
+                            skipped_products.add(product_id)
+                            continue
                 if promotion_price is not None:
                     new_row["promotionPrice"] = price_text(promotion_price)
                     new_row["promotionPriceCent"] = int(round(promotion_price * 100))
+                else:
+                    reason = "平台置灰的已报名SKU未返回当前活动报名价，无法随本次请求保留提交" if editable in ("0", "false", "False") else "保留已报名SKU缺少当前活动报名价，无法构造合法提交参数"
+                    skipped.append({
+                        "product_id": product_id,
+                        "sku_id": sku_id,
+                        "reason": reason,
+                        "editable": editable,
+                        "raw_keys": sorted(str(key) for key in row.keys())[:40],
+                    })
+                    skipped_products.add(product_id)
+                    continue
                 params.append(new_row)
                 stats["preserved_params_count"] += 1
                 continue
@@ -763,16 +1312,24 @@ class ShunshouService:
                 stats["ignored_sku_count"] += 1
                 ignored_products.add(product_id)
                 continue
+            sku_context = {
+                "sku_code": sku.sku_code or "",
+                "sku_name": sku.sku_name or text(row.get("skuName") or row.get("skuTitle")),
+                "signup_price": float(sku.shunshou_signup_price),
+            }
             if text(row.get("editable", 1)) in ("0", "false", "False"):
-                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "当前SKU不可编辑"})
+                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "当前SKU不可编辑", **sku_context})
+                skipped_products.add(product_id)
                 continue
             quantity = to_float(row.get("quantity"))
             if quantity is not None and quantity <= 0:
-                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "库存小于等于0"})
+                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "库存小于等于0", **sku_context})
+                skipped_products.add(product_id)
                 continue
             ok, reason = price_available(row, float(sku.shunshou_signup_price))
             if not ok:
-                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": reason})
+                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": reason, **sku_context})
+                skipped_products.add(product_id)
                 continue
             new_row = dict(row)
             new_row["checked"] = True
@@ -781,10 +1338,150 @@ class ShunshouService:
             params.append(new_row)
             stats["new_params_count"] += 1
             new_products_with_params.add(product_id)
+        missing_detail_products = set(new_product_ids) - detail_products
+        for product_id in sorted(missing_detail_products):
+            skipped.append({"product_id": product_id, "sku_id": "", "reason": "淘宝SKU明细未返回该商品，无法提交报名"})
+            skipped_products.add(product_id)
         stats["ignored_product_ids"] = sorted(
             product_id for product_id in ignored_products if product_id in new_product_ids and product_id not in new_products_with_params
         )
+        stats["submitted_product_ids"] = sorted(product_id for product_id in new_products_with_params if product_id in new_product_ids)
+        stats["failed_product_ids"] = sorted(
+            product_id
+            for product_id in set(new_product_ids)
+            if product_id not in new_products_with_params
+        )
         return params, skipped, stats
+
+    def _validate_submit_params_legacy(self, params: list[dict[str, Any]]) -> list[dict[str, str]]:
+        invalid: list[dict[str, str]] = []
+        for row in params:
+            product_id = text(row.get("itemId"))
+            sku_id = text(row.get("skuId"))
+            price = to_float(row.get("promotionPrice"))
+            price_cent = to_int(row.get("promotionPriceCent"))
+            if not product_id or not sku_id:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "缺 itemId 或 skuId"})
+            elif price is None or price_cent is None:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "缺 promotionPrice 或 promotionPriceCent"})
+        return invalid
+
+    def _build_update_price_params(
+        self,
+        *,
+        shop: Shop,
+        detail_rows: list[dict[str, Any]],
+        update_product_ids: set[str],
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+        params: list[dict[str, Any]] = []
+        skipped: list[dict[str, Any]] = []
+        stats = {"updated_params_count": 0, "preserved_params_count": 0, "unchanged_params_count": 0}
+        for row in detail_rows:
+            product_id = text(row.get("itemId"))
+            sku_id = text(row.get("skuId"))
+            new_row = dict(row)
+            new_row["checked"] = True
+            if product_id not in update_product_ids:
+                normalize_existing_promotion_price(new_row)
+                if activity_signup_price(new_row) is None and text(new_row.get("editable", 1)) not in ("0", "false", "False"):
+                    sku = self.session.exec(
+                        select(ProductSku).where(
+                            ProductSku.platform == shop.platform,
+                            ProductSku.shop_id == shop.shop_id,
+                            ProductSku.product_id == product_id,
+                            ProductSku.sku_id == sku_id,
+                            ProductSku.status == "active",
+                        )
+                    ).first()
+                    if sku and sku.shunshou_signup_price is not None:
+                        ok, reason = price_available(row, float(sku.shunshou_signup_price))
+                        if ok:
+                            new_row["promotionPrice"] = price_text(float(sku.shunshou_signup_price))
+                            new_row["promotionPriceCent"] = int(round(float(sku.shunshou_signup_price) * 100))
+                        else:
+                            skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": f"保留SKU补齐报名价失败：{reason}"})
+                if activity_signup_price(new_row) is None:
+                    skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "保留SKU缺少当前活动报名价，无法构造合法提交参数"})
+                    continue
+                params.append(new_row)
+                stats["preserved_params_count"] += 1
+                continue
+
+            sku = self.session.exec(
+                select(ProductSku).where(
+                    ProductSku.platform == shop.platform,
+                    ProductSku.shop_id == shop.shop_id,
+                    ProductSku.product_id == product_id,
+                    ProductSku.sku_id == sku_id,
+                    ProductSku.status == "active",
+                )
+            ).first()
+            if not sku or sku.shunshou_signup_price is None:
+                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "本地SKU没有顺手报名价"})
+                normalize_existing_promotion_price(new_row)
+                if activity_signup_price(new_row) is None:
+                    skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "目标SKU缺少本地顺手报名价，且淘宝未返回当前活动报名价"})
+                    continue
+                params.append(new_row)
+                stats["preserved_params_count"] += 1
+                continue
+            ok, reason = price_available(row, float(sku.shunshou_signup_price))
+            if not ok:
+                skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": reason})
+                normalize_existing_promotion_price(new_row)
+                if activity_signup_price(new_row) is None:
+                    skipped.append({"product_id": product_id, "sku_id": sku_id, "reason": "目标SKU价格不符合活动限制，且淘宝未返回当前活动报名价"})
+                    continue
+                params.append(new_row)
+                stats["preserved_params_count"] += 1
+                continue
+            current_price = activity_signup_price(row)
+            if current_price is not None and abs(current_price - float(sku.shunshou_signup_price)) < 0.01:
+                stats["unchanged_params_count"] += 1
+            else:
+                stats["updated_params_count"] += 1
+            new_row["promotionPrice"] = price_text(float(sku.shunshou_signup_price))
+            new_row["promotionPriceCent"] = int(round(float(sku.shunshou_signup_price) * 100))
+            params.append(new_row)
+        return params, skipped, stats
+
+    def _validate_submit_params(
+        self,
+        params: list[dict[str, Any]],
+        *,
+        required_new_product_ids: set[str] | None = None,
+        allowed_product_ids: set[str] | None = None,
+    ) -> list[dict[str, str]]:
+        invalid: list[dict[str, str]] = []
+        required_new_product_ids = {text(product_id) for product_id in (required_new_product_ids or set()) if text(product_id)}
+        allowed_product_ids = {text(product_id) for product_id in (allowed_product_ids or set()) if text(product_id)}
+        seen_skus: set[tuple[str, str]] = set()
+        product_ids_with_params: set[str] = set()
+        for row in params:
+            product_id = text(row.get("itemId"))
+            sku_id = text(row.get("skuId"))
+            price = to_float(row.get("promotionPrice"))
+            price_cent = to_int(row.get("promotionPriceCent"))
+            if not product_id or not sku_id:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "缺 itemId 或 skuId"})
+                continue
+            product_ids_with_params.add(product_id)
+            key = (product_id, sku_id)
+            if key in seen_skus:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "重复SKU参数"})
+            seen_skus.add(key)
+            if allowed_product_ids and product_id not in allowed_product_ids:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "提交参数包含非本次活动目标商品"})
+            if price is None or price_cent is None:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "缺 promotionPrice 或 promotionPriceCent"})
+                continue
+            if price <= 0 or price_cent <= 0:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "报名价必须大于0"})
+            elif abs(int(round(price * 100)) - price_cent) > 1:
+                invalid.append({"product_id": product_id, "sku_id": sku_id, "reason": "promotionPrice 与 promotionPriceCent 不一致"})
+        for product_id in sorted(required_new_product_ids - product_ids_with_params):
+            invalid.append({"product_id": product_id, "sku_id": "", "reason": "新增商品没有任何可提交SKU"})
+        return invalid
 
     def _submit_signup(
         self,
@@ -840,9 +1537,11 @@ class ShunshouService:
         params: list[dict[str, Any]],
         submit_result: dict[str, Any],
         product_ids: list[str],
+        removed_product_ids: list[str] | None = None,
     ) -> None:
         now = datetime.now()
         product_ids = list(dict.fromkeys(text(product_id) for product_id in product_ids if text(product_id)))
+        removed_product_ids = list(dict.fromkeys(text(product_id) for product_id in (removed_product_ids or []) if text(product_id)))
         for product_id in product_ids:
             item = self.session.exec(
                 select(ShunshouActivityItem).where(
@@ -858,6 +1557,23 @@ class ShunshouService:
             item.activity_item_status = "已参加活动"
             item.is_joined = 1
             item.raw_json = {"submit_result": submit_result, "params_count": len(params)}
+            item.updated_at = now
+            self.session.add(item)
+        for product_id in removed_product_ids:
+            item = self.session.exec(
+                select(ShunshouActivityItem).where(
+                    ShunshouActivityItem.platform == shop.platform,
+                    ShunshouActivityItem.shop_id == shop.shop_id,
+                    ShunshouActivityItem.activity_id == activity_id,
+                    ShunshouActivityItem.product_id == product_id,
+                )
+            ).first()
+            if not item:
+                continue
+            item.warn_status = "null"
+            item.activity_item_status = "可报名"
+            item.is_joined = 0
+            item.raw_json = {"submit_result": submit_result, "removed": True}
             item.updated_at = now
             self.session.add(item)
         activity = self.session.exec(
@@ -880,6 +1596,38 @@ class ShunshouService:
             activity.signed_item_count = len({text(product_id) for product_id in signed_product_ids if text(product_id)})
             activity.updated_at = now
             self.session.add(activity)
+        self.session.commit()
+
+    def _mark_signup_price_update(
+        self,
+        *,
+        shop: Shop,
+        activity_id: str,
+        product_ids: list[str],
+        submit_result: dict[str, Any],
+        updated_params_count: int,
+    ) -> None:
+        now = datetime.now()
+        for product_id in product_ids:
+            item = self.session.exec(
+                select(ShunshouActivityItem).where(
+                    ShunshouActivityItem.platform == shop.platform,
+                    ShunshouActivityItem.shop_id == shop.shop_id,
+                    ShunshouActivityItem.activity_id == activity_id,
+                    ShunshouActivityItem.product_id == product_id,
+                )
+            ).first()
+            if not item:
+                continue
+            raw_json = item.raw_json if isinstance(item.raw_json, dict) else {}
+            raw_json["price_update"] = {
+                "submit_result": submit_result,
+                "updated_params_count": updated_params_count,
+                "updated_at": now.isoformat(),
+            }
+            item.raw_json = raw_json
+            item.updated_at = now
+            self.session.add(item)
         self.session.commit()
 
     def _fetch_activity_rows(
@@ -910,6 +1658,32 @@ class ShunshouService:
                     break
                 current += 1
         return rows
+
+    def _refresh_activity_item_snapshot(
+        self,
+        *,
+        shop: Shop,
+        cookie_dict: dict[str, str],
+        xsrf_token: str,
+        user_agent: str | None,
+        activity_id: str,
+        cross_shop: bool,
+        auction_status: int,
+    ) -> None:
+        rows = self._fetch_activity_item_rows(
+            cookie_dict=cookie_dict,
+            xsrf_token=xsrf_token,
+            user_agent=user_agent,
+            activity_id=activity_id,
+            cross_shop=cross_shop,
+            auction_status=auction_status,
+        )
+        self._upsert_activity_items(
+            shop=shop,
+            activity_id=activity_id,
+            auction_status=auction_status,
+            rows=rows,
+        )
 
     def _fetch_activity_item_rows(
         self,
@@ -1151,61 +1925,42 @@ def parse_json_response(response: httpx.Response, label: str) -> dict[str, Any]:
     return payload
 
 
-def normalize_activity(item: dict[str, Any]) -> dict[str, Any]:
-    signed_count, max_limit = extract_capacity(item)
-    status_value = to_int(item.get("activityStatus"))
-    return {
-        "activity_id": text(item.get("activityId")),
-        "activity_name": text(pick(item, "name", "activityName", "activity_name", "title", "activityTitle")),
-        "activity_status": status_value,
-        "activity_status_text": status_text(status_value),
-        "signed_item_count": signed_count,
-        "max_item_limit": max_limit,
-        "start_time": pick(item, "startTime", "start_time", "开始时间"),
-        "end_time": pick(item, "endTime", "end_time", "结束时间"),
-        "raw": item,
-    }
+def submit_error_message(payload: dict[str, Any]) -> str:
+    if not isinstance(payload, dict):
+        return "淘宝提交返回格式异常"
+    code = payload.get("code") or payload.get("errorCode") or ""
+    message = payload.get("message") or payload.get("errorMsg") or payload.get("msg") or ""
+    data = payload.get("data")
+    parts = []
+    if code:
+        parts.append(f"code={code}")
+    if message:
+        parts.append(str(message))
+    if data not in (None, "", [], {}):
+        parts.append(f"data={str(data)[:300]}")
+    return "；".join(parts) or f"淘宝提交未返回成功：{str(payload)[:500]}"
 
 
-def normalize_activity_item(item: dict[str, Any], *, activity_id: str, auction_status: int) -> dict[str, Any]:
-    status_info = normalize_candidate_status(item.get("warnMessage"))
-    return {
-        "activity_id": activity_id,
-        "product_id": text(item.get("itemId")),
-        "item_title": text(item.get("itemTitle") or item.get("title") or item.get("itemName")),
-        "warn_message": text(item.get("warnMessage")) or None,
-        "warn_status": status_info["warn_status"],
-        "activity_item_status": status_info["activity_item_status"],
-        "is_joined": status_info["is_joined"],
-        "auction_status": auction_status,
-        "raw": item,
-    }
+def normalize_product_ids(product_ids: list[str]) -> list[str]:
+    return list(dict.fromkeys(text(product_id) for product_id in (product_ids or []) if text(product_id)))
 
 
-def collect_product_rows(node: Any, rows: list[dict[str, Any]]) -> None:
-    if isinstance(node, dict):
-        item_id = node.get("itemId")
-        sku_id = node.get("skuId")
-        if item_id not in (None, "") and sku_id in (None, ""):
-            rows.append(node)
-        for value in node.values():
-            collect_product_rows(value, rows)
-    elif isinstance(node, list):
-        for value in node:
-            collect_product_rows(value, rows)
+def activity_signup_price(row: dict[str, Any]) -> float | None:
+    price = to_float(row.get("promotionPrice"))
+    if price is not None:
+        return price
+    price_cent = to_int(row.get("promotionPriceCent"))
+    if price_cent is not None:
+        return price_cent / 100
+    return None
 
 
-def collect_sku_rows(node: Any, rows: list[dict[str, Any]]) -> None:
-    if isinstance(node, dict):
-        item_id = node.get("itemId")
-        sku_id = node.get("skuId")
-        if item_id not in (None, "") and sku_id not in (None, ""):
-            rows.append(node)
-        for value in node.values():
-            collect_sku_rows(value, rows)
-    elif isinstance(node, list):
-        for value in node:
-            collect_sku_rows(value, rows)
+def normalize_existing_promotion_price(row: dict[str, Any]) -> None:
+    promotion_price = activity_signup_price(row)
+    if promotion_price is None:
+        return
+    row["promotionPrice"] = price_text(promotion_price)
+    row["promotionPriceCent"] = int(round(promotion_price * 100))
 
 
 def assign_items_to_activities(
@@ -1273,152 +2028,3 @@ def remaining_capacity(
     real_limit = to_int(activity.get("max_item_limit")) or real_capacity_fallback
     effective_limit = min(real_limit, custom_capacity_limit) if custom_capacity_limit > 0 else real_limit
     return effective_limit - signed_count - reserve_item_count - int(assigned_count or 0)
-
-
-def price_available(row: dict[str, Any], price: float) -> tuple[bool, str]:
-    min_limit = 0.01
-    rule = row.get("hgPriceLimitRule") or {}
-    if isinstance(rule, dict):
-        min_rule = to_float(rule.get("minPriceLimit"))
-        if min_rule is not None:
-            min_limit = min_rule
-    max_candidates = [to_float(row.get("originalPrice")), to_float(row.get("minDiscountPrice"))]
-    if isinstance(rule, dict):
-        max_candidates.append(to_float(rule.get("hgPriceUpperLimit")))
-    max_values = [value for value in max_candidates if value is not None]
-    max_limit = min(max_values) if max_values else None
-    if price < min_limit:
-        return False, f"价格低于最小值 {min_limit}"
-    if max_limit is not None and price > max_limit:
-        return False, f"价格高于最大值 {max_limit}"
-    return True, ""
-
-
-def price_text(value: float) -> str:
-    rendered = f"{float(value):.2f}"
-    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
-
-
-def normalize_assignments(value: dict[str, list[str]]) -> dict[str, list[str]]:
-    normalized: dict[str, list[str]] = {}
-    for activity_id, product_ids in (value or {}).items():
-        aid = text(activity_id)
-        if not aid:
-            continue
-        ids = [text(product_id) for product_id in (product_ids or []) if text(product_id)]
-        if ids:
-            normalized[aid] = list(dict.fromkeys(ids))
-    return normalized
-
-
-def normalize_candidate_status(warn_message: Any) -> dict[str, Any]:
-    message = text(warn_message)
-    if not message:
-        return {"warn_status": "null", "activity_item_status": "可报名", "is_joined": 0}
-    if "已经参加当前的活动" in message or "已参加当前活动" in message or "已经参加活动" in message:
-        return {"warn_status": "not_null", "activity_item_status": "已参加活动", "is_joined": 1}
-    return {"warn_status": "not_null", "activity_item_status": "其他原因", "is_joined": 0}
-
-
-def extract_capacity(item: dict[str, Any]) -> tuple[int | None, int | None]:
-    signed = to_int(pick(item, "signedItemCount", "joinedItemCount", "joinItemCount", "applyItemCount", "itemSignedCount"))
-    limit = to_int(pick(item, "maxItemLimit", "itemLimit", "itemMaxLimit", "maxItemCount", "activityItemLimit"))
-    for value in item.values():
-        if signed is not None and limit is not None:
-            break
-        if isinstance(value, str) and "/" in value:
-            pair_signed, pair_limit = parse_capacity_pair(value)
-            signed = signed if signed is not None else pair_signed
-            limit = limit if limit is not None else pair_limit
-    return signed, limit
-
-
-def parse_capacity_pair(value: str) -> tuple[int | None, int | None]:
-    match = re.search(r"(\d+)\s*/\s*(\d+)", value)
-    if not match:
-        return None, None
-    left = to_int(match.group(1))
-    right = to_int(match.group(2))
-    if left is not None and right is not None and left > right:
-        left, right = right, left
-    return left, right
-
-
-def pick(item: dict[str, Any], *keys: str) -> Any:
-    for key in keys:
-        value = item.get(key)
-        if value not in (None, ""):
-            return value
-    return None
-
-
-def status_text(status: int | None) -> str:
-    return STATUS_MAP.get(status, text(status))
-
-
-def to_int(value: Any) -> int | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, bool):
-        return int(value)
-    if isinstance(value, (int, float)):
-        return int(value)
-    match = re.search(r"-?\d+", text(value).replace(",", ""))
-    return int(match.group(0)) if match else None
-
-
-def to_float(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    if isinstance(value, bool):
-        return float(int(value))
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(text(value).replace(",", ""))
-    except ValueError:
-        return None
-
-
-def normalize_wait(min_seconds: float, max_seconds: float) -> tuple[float, float]:
-    try:
-        wait_min = float(min_seconds)
-    except (TypeError, ValueError):
-        wait_min = 0.0
-    try:
-        wait_max = float(max_seconds)
-    except (TypeError, ValueError):
-        wait_max = wait_min
-    wait_min = max(0.0, wait_min)
-    wait_max = max(wait_min, wait_max)
-    return wait_min, wait_max
-
-
-def sleep_random(wait_min: float, wait_max: float) -> None:
-    if wait_max <= 0:
-        return
-    time.sleep(random.uniform(wait_min, wait_max))
-
-
-def text(value: Any) -> str:
-    if value is None:
-        return ""
-    return str(value).strip()
-
-
-def default_user_agent() -> str:
-    return "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
-
-
-def is_auth_error(message: Any) -> bool:
-    value = str(message).upper()
-    return "LOGIN" in value or "COOKIE" in value or "TOKEN" in value or "登录" in value
-
-
-def is_submit_success(payload: dict[str, Any]) -> bool:
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("success") is not True:
-        return False
-    code = str(payload.get("code") or "")
-    return code in ("", "200")

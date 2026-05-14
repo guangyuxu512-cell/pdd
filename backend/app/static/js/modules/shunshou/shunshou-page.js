@@ -2,6 +2,8 @@ import { api } from "../../api/client.js";
 import { el, formValue } from "../../core/dom.js";
 import { addLog, endTask, startTask } from "../../core/state.js";
 import { renderTable } from "../../components/table.js";
+import { renderImagePreview, renderThumbButton } from "../../components/media.js";
+import { formatMoney, formatTime, normalizeNumber } from "../../core/format.js";
 
 let selectedShop = "";
 let activeTab = "signup";
@@ -19,7 +21,9 @@ let previewImageUrl = "";
 let signupLimit = 160;
 let pxiMin = 70;
 let soldTotalMin = 3;
-let targetActivityCount = 2;
+let signupProductId = "";
+let joinedCountMin = "0";
+let joinedCountMax = "0";
 let signingUp = false;
 let signupModalOpen = false;
 let previewingSignup = false;
@@ -33,6 +37,10 @@ let signupRelistStockMode = "per_sku";
 let signupPreviewRows = [];
 let signupActivityPickerProductId = "";
 const selectedSignupKeys = new Set();
+const selectedSignupProductIds = new Set();
+let lastAutoPriceNoChangeLogAt = 0;
+
+window.autoDetectShunshouSignupPriceChanges = autoDetectSignupPriceChanges;
 
 export async function renderShunshouPage(container) {
   const shops = await api.get("/shops");
@@ -105,21 +113,29 @@ function renderItemsTab() {
 }
 
 function renderSignupTab() {
+  const signupChanges = buildSignupChanges();
   return [
     renderReadinessPanel(),
+    el("div", { class: "signup-summary-row", id: "signup-summary-row", text: signupSummaryText(signupChanges) }),
     el("div", { class: "shunshou-toolbar" }, [
       el("button", { class: "primary", disabled: previewingSignup, onclick: openSignupModal }, [previewingSignup ? "获取中..." : "获取符合条件商品"]),
       el("button", { class: "primary", disabled: signingUp || signupPreviewRows.length === 0, onclick: signupPreviewSelection }, [
-        signingUp ? "报名中..." : "报名勾选/全部",
+        signingUp ? "提交中..." : "提交报名变更",
       ]),
       el("button", { disabled: relistingSignupProducts || signupPreviewRows.length === 0, onclick: openSignupModifyModal }, [
         relistingSignupProducts ? "执行中..." : "一键修改",
       ]),
       el("button", { disabled: !relistingSignupProducts, onclick: stopSignupModify }, ["终止修改"]),
-      el("span", { class: "muted", text: `预览 ${signupPreviewRows.length} 条，已勾选 ${selectedSignupKeys.size} 条` }),
+      el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts, onclick: detectSignupPriceChanges }, ["检测报名价变动"]),
+      el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts, onclick: updateJoinedSignupPrices }, ["更新已报名价格"]),
+      el("button", { disabled: previewingSignup || signingUp || relistingSignupProducts || signupPreviewRows.length === 0, onclick: clearSignupPreviewRows }, ["清空列表"]),
     ]),
     renderSignupPreviewTable(),
   ];
+}
+
+function signupSummaryText(signupChanges = buildSignupChanges()) {
+  return `预览 ${signupPreviewRows.length} 条，已选商品 ${selectedSignupProductIds.size} 条，活动变更 ${signupChanges.addedCount + signupChanges.removedCount} 项`;
 }
 
 function renderReadinessPanel() {
@@ -341,10 +357,13 @@ function signupPreviewColumns() {
       renderHeader: () => renderSignupPageCheck(),
       render: (row) =>
         el("input", {
-          class: "row-check",
+          class: "row-check signup-row-check",
           type: "checkbox",
-          checked: selectedSignupActivities(row).length > 0,
-          onchange: (event) => toggleSignupRow(row, event.target.checked),
+          checked: selectedSignupProductIds.has(String(row.product_id)),
+          onchange: (event) => {
+            toggleSignupProduct(row, event.target.checked);
+            updateSignupSelectionUi();
+          },
         }),
     },
     { title: "ID", width: "4%", render: (_row, index) => String(index + 1) },
@@ -357,44 +376,6 @@ function signupPreviewColumns() {
     { title: "PXI", key: "pxi_score", width: "5%" },
     { title: "已报", key: "joined_count", width: "5%" },
   ];
-}
-
-function renderSignupPreviewTableOld() {
-  return renderTable({
-    rows: signupPreviewRows,
-    emptyText: "暂无待报名商品。点击“获取符合条件商品”后再勾选报名。",
-    className: "product-table",
-    columns: [
-      {
-        title: "",
-        className: "check-cell",
-        width: "4%",
-        renderHeader: () => renderSignupPageCheck(),
-        render: (row) =>
-          el("input", {
-            class: "row-check",
-            type: "checkbox",
-            checked: selectedSignupKeys.has(signupKey(row)),
-            onchange: (event) => toggleSignupRow(row, event.target.checked),
-          }),
-      },
-      { title: "ID", width: "4%", render: (_row, index) => String(index + 1) },
-      { title: "主图", width: "7%", render: (row) => renderProductThumb(row.image_url) },
-      { title: "活动ID", key: "activity_id", width: "15%" },
-      { title: "商品ID", key: "product_id", width: "15%" },
-      { title: "标题", key: "title", width: "27%" },
-      {
-        title: "价格检查",
-        width: "12%",
-        render: (row) => renderSignupPriceStatus(row),
-        titleValue: (row) => signupPriceStatusTitle(row),
-      },
-      { title: "顺手报名价", width: "10%", render: (row) => formatSignupPrice(row) },
-      { title: "活动", width: "18%", render: (row) => renderSignupActivityChoices(row) },
-      { title: "PXI", key: "pxi_score", width: "5%" },
-      { title: "已报", key: "joined_count", width: "5%" },
-    ],
-  });
 }
 
 async function syncActivities(render = true) {
@@ -445,82 +426,33 @@ async function closeSignupModal() {
   await window.renderActiveModule();
 }
 
-async function signupSelectedActivity() {
-  const limit = normalizeSignupLimit(formValue("shunshou-signup-limit") || signupLimit);
-  signupLimit = limit;
-  pxiMin = normalizeNumber(formValue("shunshou-pxi-min"), 70);
-  soldTotalMin = Math.floor(normalizeNumber(formValue("shunshou-sold-min"), 3));
-  targetActivityCount = Math.max(1, Math.floor(normalizeNumber(formValue("shunshou-target-count"), 2)));
-  if (!selectedShop) {
-    alert("请先选择店铺");
-    return;
-  }
-  signupModalOpen = false;
-  const [platform, shop_id] = selectedShop.split("::");
-  signingUp = true;
-  const taskId = startTask("正在一键报名", shopLabel(selectedShop));
-  addLog("info", "开始一键报名", `PXI>${pxiMin} / 销量>=${soldTotalMin} / 每商品${targetActivityCount}个活动 / 单活动容量${signupLimit}`);
-  await window.renderActiveModule();
-  try {
-    const result = await api.post("/shunshou/signup", {
-      platform,
-      shop_id,
-      pxi_min: pxiMin,
-      sold_total_min: soldTotalMin,
-      target_activity_count: targetActivityCount,
-      custom_capacity_limit: signupLimit,
-      reserve_item_count: 3,
-      real_capacity_fallback: 171,
-      cross_shop: false,
-      batch_size: 25,
-      min_wait_seconds: 0.6,
-      max_wait_seconds: 1.8,
-      dry_run: false,
-    });
-    activityItems = await loadActivityItems();
-    activities = await loadActivities();
-    addLog(
-      "success",
-      "结束一键报名",
-      `候选${result.candidate_count}，分配${result.assignment_count}，提交活动${result.submitted_activity_count}，SKU ${result.submitted_sku_count}，跳过${result.skipped_count}`,
-    );
-    logSignupResultDetails(result);
-  } catch (error) {
-    addLog("error", "一键报名失败", error.message);
-    alert(error.message);
-  } finally {
-    signingUp = false;
-    endTask(taskId);
-    await window.renderActiveModule();
-  }
-}
-
-async function previewSignupCandidates() {
+async function previewSignupCandidates(render = true) {
   const config = readSignupConfig();
   if (!config) return;
   previewingSignup = true;
   signupModalOpen = false;
   const taskId = startTask("正在获取符合条件商品", shopLabel(selectedShop));
-  addLog("info", "获取符合条件商品", `PXI>${pxiMin} / 销量>=${soldTotalMin} / 每商品${targetActivityCount}个活动 / 单活动容量${signupLimit}`);
-  await window.renderActiveModule();
+  addLog("info", "获取符合条件商品", `PXI>${pxiMin} / 销量>=${soldTotalMin} / 按商品手动选择活动`);
+  if (render) await window.renderActiveModule();
   try {
     const result = await api.post("/shunshou/signup/preview", config);
     signupPreviewRows = result.rows || [];
     selectedSignupKeys.clear();
+    selectedSignupProductIds.clear();
     signupPreviewRows.forEach((row) => {
       (row.activities || []).forEach((activity) => {
         if (activity.selected !== false) selectedSignupKeys.add(signupActivityKey(row, activity));
       });
     });
     readiness = await loadReadiness();
-    addLog("success", "符合条件商品获取完成", `候选${result.candidate_count}，可分配${result.assignment_count}，跳过${(result.skipped_items || []).length}`);
+    addLog("success", "符合条件商品获取完成", `候选${result.candidate_count}，可选择活动${result.assignment_count}，跳过${(result.skipped_items || []).length}`);
   } catch (error) {
     addLog("error", "获取符合条件商品失败", error.message);
     alert(error.message);
   } finally {
     previewingSignup = false;
     endTask(taskId);
-    await window.renderActiveModule();
+    if (render) await window.renderActiveModule();
   }
 }
 
@@ -547,8 +479,8 @@ async function relistSignupPreviewProducts() {
     alert("请至少勾选一个修改动作");
     return;
   }
-  const sourceRows = selectedSignupKeys.size
-    ? signupPreviewRows.filter((row) => selectedSignupKeys.has(signupKey(row)))
+  const sourceRows = selectedSignupProductIds.size
+    ? signupPreviewRows.filter((row) => selectedSignupProductIds.has(String(row.product_id)))
     : signupModifyEditPrice
       ? signupPreviewRows.filter((row) => Number(row.price_mismatch_count || 0) > 0)
       : signupPreviewRows;
@@ -620,38 +552,184 @@ function stopSignupModify() {
   window.renderActiveModule();
 }
 
+async function clearSignupPreviewRows() {
+  signupPreviewRows = [];
+  selectedSignupProductIds.clear();
+  selectedSignupKeys.clear();
+  signupActivityPickerProductId = "";
+  addLog("info", "清空报名商品列表", "下次检测报名价变动将按全部已报名商品扫描");
+  await window.renderActiveModule();
+}
+
+async function detectSignupPriceChanges() {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  const productIds = selectedSignupProductIds.size
+    ? [...selectedSignupProductIds]
+    : signupPreviewRows.map((row) => String(row.product_id || "")).filter(Boolean);
+  const [platform, shop_id] = selectedShop.split("::");
+  const scopeText = selectedSignupProductIds.size
+    ? `${productIds.length} 个已勾选商品`
+    : productIds.length
+      ? `${productIds.length} 个列表商品`
+      : "全部已报名商品";
+  const taskId = startTask("正在检测报名价变动", scopeText);
+  addLog("info", "开始检测报名价变动", `范围：${scopeText}；对比活动当前报名价和飞书顺手报名价`);
+  await window.renderActiveModule();
+  try {
+    const result = await api.post("/shunshou/signup/price-changes/detect", {
+      platform,
+      shop_id,
+      product_ids: productIds,
+      cross_shop: false,
+      batch_size: 25,
+      min_wait_seconds: 0.4,
+      max_wait_seconds: 0.8,
+    });
+    const changedProductIds = applySignupPriceChangeResult(result);
+    addLog("success", "检测报名价变动完成", `已报名商品${result.joined_product_count || 0}个，活动${result.activity_count}个，SKU ${result.sku_count}个，变动${result.changed_count}个，可更新${result.can_update_count}个，已自动勾选${changedProductIds.size}个商品`);
+    logSignupPriceChangeRows(result.rows || []);
+  } catch (error) {
+    addLog("error", "检测报名价变动失败", error.message);
+    alert(error.message);
+  } finally {
+    endTask(taskId);
+    await window.renderActiveModule();
+  }
+}
+
+async function autoDetectSignupPriceChanges({ updatedCount = 0 } = {}) {
+  if (!selectedShop) return;
+  if (previewingSignup || signingUp || relistingSignupProducts || syncingActivities || syncingItems) return;
+  if (signupPreviewRows.length && !hasPriceChangePreviewRows()) {
+    if (updatedCount > 0) addLog("info", "自动报名价检测跳过", "当前表格是报名候选列表，为避免覆盖选择，请手动清空列表或手动检测");
+    return;
+  }
+  const [platform, shop_id] = selectedShop.split("::");
+  try {
+    const result = await api.post("/shunshou/signup/price-changes/detect", {
+      platform,
+      shop_id,
+      product_ids: [],
+      cross_shop: false,
+      batch_size: 25,
+      min_wait_seconds: 0.3,
+      max_wait_seconds: 0.6,
+    });
+    if (Number(result.can_update_count || 0) <= 0) {
+      if (hasPriceChangePreviewRows()) {
+        signupPreviewRows = [];
+        selectedSignupProductIds.clear();
+        selectedSignupKeys.clear();
+        await window.renderActiveModule();
+      }
+      const now = Date.now();
+      if (now - lastAutoPriceNoChangeLogAt > 5 * 60 * 1000) {
+        addLog("info", "自动报名价检测完成", `全部已报名商品暂无待更新价格，已报名商品${result.joined_product_count || 0}个`);
+        lastAutoPriceNoChangeLogAt = now;
+      }
+      return;
+    }
+    const changedProductIds = applySignupPriceChangeResult(result);
+    addLog("success", "自动发现报名价变动", `已报名商品${result.joined_product_count || 0}个，活动${result.activity_count}个，可更新SKU ${result.can_update_count}个，已自动勾选${changedProductIds.size}个商品`);
+    await window.renderActiveModule();
+  } catch (error) {
+    addLog("error", "自动报名价检测失败", error.message);
+  }
+}
+
+function applySignupPriceChangeResult(result) {
+  const changedProductIds = new Set((result.rows || []).filter((row) => row.changed && row.can_update).map((row) => String(row.product_id)));
+  signupPreviewRows = buildSignupPriceChangePreviewRows(result.rows || []);
+  selectedSignupKeys.clear();
+  selectedSignupProductIds.clear();
+  changedProductIds.forEach((productId) => selectedSignupProductIds.add(productId));
+  signupPreviewRows.forEach((row) => {
+    if (row.preview_mode !== "price_change") return;
+    (row.activities || []).forEach((activity) => {
+      if (activity.selected !== false) selectedSignupKeys.add(signupActivityKey(row, activity));
+    });
+  });
+  return changedProductIds;
+}
+
+async function updateJoinedSignupPrices() {
+  if (!selectedShop) {
+    alert("请先选择店铺");
+    return;
+  }
+  const assignmentsByActivity = buildPriceChangeUpdateAssignments();
+  const productIds = [...selectedSignupProductIds];
+  if (!productIds.length) {
+    addLog("error", "更新已报名价格失败", "请先勾选商品，或先点击“检测报名价变动”自动勾选变动商品");
+    alert("请先勾选要更新已报名价格的商品，或先点击“检测报名价变动”自动勾选。");
+    return;
+  }
+  if (hasPriceChangePreviewRows() && !Object.keys(assignmentsByActivity).length) {
+    addLog("error", "更新已报名价格失败", "请在活动列选择至少一个要更新的活动");
+    alert("请在活动列选择至少一个要更新价格的活动。");
+    return;
+  }
+  const [platform, shop_id] = selectedShop.split("::");
+  const activityCount = Object.keys(assignmentsByActivity).length;
+  const taskId = startTask("正在更新已报名价格", `${productIds.length} 个商品${activityCount ? ` / ${activityCount} 个活动` : ""}`);
+  addLog("info", "开始更新已报名价格", `商品${productIds.length}个${activityCount ? `，活动${activityCount}个` : ""}；只更新报名价，不改变活动关系`);
+  await window.renderActiveModule();
+  try {
+    const result = await api.post("/shunshou/signup/price-changes/update", {
+      platform,
+      shop_id,
+      product_ids: productIds,
+      assignments_by_activity: Object.keys(assignmentsByActivity).length ? assignmentsByActivity : null,
+      cross_shop: false,
+      batch_size: 25,
+      min_wait_seconds: 0.6,
+      max_wait_seconds: 1.2,
+      dry_run: false,
+    });
+    addLog("success", "更新已报名价格完成", `提交活动${result.submitted_activity_count}个，更新SKU ${result.updated_sku_count}个，跳过${result.skipped_count}个`);
+    logSignupPriceUpdateRows(result);
+    await verifySignupPriceUpdateResult({ platform, shop_id, productIds, assignmentsByActivity });
+  } catch (error) {
+    addLog("error", "更新已报名价格失败", error.message);
+    alert(error.message);
+  } finally {
+    endTask(taskId);
+    await window.renderActiveModule();
+  }
+}
+
 async function signupPreviewSelection() {
   const config = readSignupConfig();
   if (!config) return;
-  const selectedRows = signupPreviewRows.filter((row) => selectedSignupActivities(row).length > 0);
-  if (!selectedRows.length) {
-    alert("没有可报名的预览商品");
+  const changes = buildSignupChanges();
+  if (!changes.changedRows.length) {
+    alert("没有报名变更。请先在活动弹窗里勾选要报名的活动，或取消已报名活动。");
     return;
   }
-  const blockedRows = selectedRows.filter(needsPriceFix);
+  const blockedRows = changes.addedRows.filter(needsPriceFix);
   if (blockedRows.length) {
     alert(`有 ${blockedRows.length} 条商品需要先恢复正常价。请点击“恢复正常价”后重新获取符合条件商品，再报名。`);
     addLog("error", "报名前价格检查", `拦截 ${blockedRows.length} 条需改价/缺正常价商品`);
     return;
   }
-  const assignments = {};
-  selectedRows.forEach((row) => {
-    selectedSignupActivities(row).forEach((activity) => {
-      assignments[activity.activity_id] ||= [];
-      if (!assignments[activity.activity_id].includes(row.product_id)) assignments[activity.activity_id].push(row.product_id);
-    });
-  });
   signingUp = true;
-  const taskId = startTask("正在报名检测/提交", `${selectedRows.length} 条候选`);
-  addLog("info", "报名前检测", `重新检测 ${selectedRows.length} 条候选，确认PXI、活动状态和价格`);
+  const taskId = startTask("正在报名检测/提交", `${changes.changedRows.length} 条变更`);
+  addLog("info", "报名前检测", `新增${changes.addedCount}，取消${changes.removedCount}，确认PXI、活动状态和价格`);
   await window.renderActiveModule();
   try {
-    const check = await api.post("/shunshou/signup/check", { ...config, assignments_by_activity: assignments });
+    const check = await api.post("/shunshou/signup/check", {
+      ...config,
+      assignments_by_activity: changes.assignments,
+      remove_assignments_by_activity: changes.removals,
+    });
     const failedRows = check.failed_rows || [];
     if (failedRows.length) {
       const detailText = failedRows.slice(0, 20).map((row) => `${row.product_id}/${row.activity_id}:${row.reason || "no reason"}`).join("; ");
-      addLog("error", "signup check failed", `${failedRows.length} rows: ${detailText}`);
-      alert(`signup check failed: ${failedRows.length} rows\n${detailText}`);
+      addLog("error", "报名前检测失败", `${failedRows.length} 条：${detailText}`);
+      alert(`报名前检测失败：${failedRows.length} 条\n${detailText}`);
       return;
     }
     const missingRows = [];
@@ -662,28 +740,26 @@ async function signupPreviewSelection() {
       alert(`报名前检测未通过：${missingRows.length} 条商品当前不再可报名。请重新点击“获取符合条件商品”。`);
       return;
     }
-    addLog("success", "报名前检测通过", `提交 ${selectedRows.length} 条，活动 ${Object.keys(assignments).length} 个`);
-    addLog("info", "开始报名预览商品", `提交 ${selectedRows.length} 条，活动 ${Object.keys(assignments).length} 个`);
-    const result = await api.post("/shunshou/signup", { ...config, assignments_by_activity: assignments });
+    addLog("success", "报名前检测通过", `新增${changes.addedCount}，取消${changes.removedCount}，涉及活动 ${changes.activityCount} 个`);
+    addLog("info", "开始提交报名变更", `新增${changes.addedCount}，取消${changes.removedCount}，涉及活动 ${changes.activityCount} 个`);
+    const result = await api.post("/shunshou/signup", {
+      ...config,
+      assignments_by_activity: changes.assignments,
+      remove_assignments_by_activity: changes.removals,
+    });
     activityItems = await loadActivityItems();
     activities = await loadActivities();
     readiness = await loadReadiness();
-    const successKeys = successfulSignupKeys(result, selectedRows);
-    if (successKeys.size) {
-      signupPreviewRows = signupPreviewRows.filter((row) => !successKeys.has(signupKey(row)));
-      successKeys.forEach((key) => selectedSignupKeys.delete(key));
-    }
     addLog(
       "success",
-      "结束报名预览商品",
-      `提交活动${result.submitted_activity_count}，SKU ${result.submitted_sku_count}，跳过${result.skipped_count}`,
+      "结束报名变更",
+      `提交活动${result.submitted_activity_count}，新增SKU ${result.submitted_sku_count}，跳过${result.skipped_count}`,
     );
     logSignupResultDetails(result);
-    if (!successKeys.size) {
-      addLog("error", "报名未完成", "没有任何 SKU 提交成功，预览商品已保留，请先处理日志中的跳过原因");
-    }
+    await verifySignupSubmitResult(config, changes, result);
+    await previewSignupCandidates(false);
   } catch (error) {
-    addLog("error", "报名预览商品失败", error.message);
+    addLog("error", "报名变更失败", error.message);
     alert(error.message);
   } finally {
     signingUp = false;
@@ -697,7 +773,9 @@ function readSignupConfig() {
   signupLimit = limit;
   pxiMin = normalizeNumber(formValue("shunshou-pxi-min"), 70);
   soldTotalMin = Math.floor(normalizeNumber(formValue("shunshou-sold-min"), 3));
-  targetActivityCount = Math.max(1, Math.floor(normalizeNumber(formValue("shunshou-target-count"), 2)));
+  signupProductId = formValue("shunshou-signup-product-id").trim();
+  joinedCountMin = formValue("shunshou-joined-min").trim();
+  joinedCountMax = formValue("shunshou-joined-max").trim();
   if (!selectedShop) {
     alert("请先选择店铺");
     return null;
@@ -708,7 +786,10 @@ function readSignupConfig() {
     shop_id,
     pxi_min: pxiMin,
     sold_total_min: soldTotalMin,
-    target_activity_count: targetActivityCount,
+    product_id: signupProductId || null,
+    joined_count_min: joinedCountMin === "" ? 0 : Math.max(0, Math.floor(normalizeNumber(joinedCountMin, 0))),
+    joined_count_max: joinedCountMax === "" ? 0 : Math.max(0, Math.floor(normalizeNumber(joinedCountMax, 0))),
+    target_activity_count: 1,
     custom_capacity_limit: signupLimit,
     reserve_item_count: 3,
     real_capacity_fallback: 171,
@@ -990,20 +1071,40 @@ function renderActivityActions(row) {
 }
 
 function renderSignupPageCheck() {
-  const checked = signupPreviewRows.length > 0 && signupPreviewRows.every((row) => selectedSignupActivities(row).length > 0);
+  const checked = signupPreviewRows.length > 0 && signupPreviewRows.every((row) => selectedSignupProductIds.has(String(row.product_id)));
   return el("input", {
     class: "row-check",
+    id: "signup-page-check",
     type: "checkbox",
     checked,
     disabled: signupPreviewRows.length === 0,
-    onchange: async (event) => {
-      signupPreviewRows.forEach((row) => toggleSignupRow(row, event.target.checked));
-      await window.renderActiveModule();
+    onchange: (event) => {
+      signupPreviewRows.forEach((row) => toggleSignupProduct(row, event.target.checked));
+      document.querySelectorAll(".signup-row-check").forEach((input) => {
+        input.checked = event.target.checked;
+      });
+      updateSignupSelectionUi();
     },
   });
 }
 
-function toggleSignupRow(row, checked) {
+function toggleSignupProduct(row, checked) {
+  const productId = String(row.product_id || "");
+  if (!productId) return;
+  if (checked) selectedSignupProductIds.add(productId);
+  else selectedSignupProductIds.delete(productId);
+}
+
+function updateSignupSelectionUi() {
+  const summary = document.getElementById("signup-summary-row");
+  if (summary) summary.textContent = signupSummaryText();
+  const headerCheck = document.getElementById("signup-page-check");
+  if (headerCheck) {
+    headerCheck.checked = signupPreviewRows.length > 0 && signupPreviewRows.every((row) => selectedSignupProductIds.has(String(row.product_id)));
+  }
+}
+
+function toggleSignupRowActivities(row, checked) {
   (row.activities || []).forEach((activity) => toggleSignupActivity(row, activity, checked));
 }
 
@@ -1017,7 +1118,73 @@ function selectedSignupActivities(row) {
   return (row.activities || []).filter((activity) => selectedSignupKeys.has(signupActivityKey(row, activity)));
 }
 
+function buildSignupChanges() {
+  const assignments = {};
+  const removals = {};
+  const changedRowsByProduct = new Map();
+  const addedRowsByProduct = new Map();
+  let addedCount = 0;
+  let removedCount = 0;
+  signupPreviewRows.forEach((row) => {
+    (row.activities || []).forEach((activity) => {
+      const selected = selectedSignupKeys.has(signupActivityKey(row, activity));
+      const joined = Number(activity.is_joined || 0) === 1;
+      if (selected && !joined) {
+        assignments[activity.activity_id] ||= [];
+        if (!assignments[activity.activity_id].includes(row.product_id)) assignments[activity.activity_id].push(row.product_id);
+        changedRowsByProduct.set(String(row.product_id), row);
+        addedRowsByProduct.set(String(row.product_id), row);
+        addedCount += 1;
+      } else if (!selected && joined) {
+        removals[activity.activity_id] ||= [];
+        if (!removals[activity.activity_id].includes(row.product_id)) removals[activity.activity_id].push(row.product_id);
+        changedRowsByProduct.set(String(row.product_id), row);
+        removedCount += 1;
+      }
+    });
+  });
+  return {
+    assignments,
+    removals,
+    changedRows: [...changedRowsByProduct.values()],
+    addedRows: [...addedRowsByProduct.values()],
+    addedCount,
+    removedCount,
+    activityCount: new Set([...Object.keys(assignments), ...Object.keys(removals)]).size,
+  };
+}
+
+function hasPriceChangePreviewRows() {
+  return signupPreviewRows.some((row) => row.preview_mode === "price_change");
+}
+
+function buildPriceChangeUpdateAssignments() {
+  const assignments = {};
+  signupPreviewRows
+    .filter((row) => row.preview_mode === "price_change" && selectedSignupProductIds.has(String(row.product_id)))
+    .forEach((row) => {
+      (row.activities || []).forEach((activity) => {
+        if (!selectedSignupKeys.has(signupActivityKey(row, activity))) return;
+        const activityId = String(activity.activity_id || "");
+        const productId = String(row.product_id || "");
+        if (!activityId || !productId) return;
+        if (!assignments[activityId]) assignments[activityId] = [];
+        if (!assignments[activityId].includes(productId)) assignments[activityId].push(productId);
+      });
+    });
+  return assignments;
+}
+
 function renderSignupActivityChoices(row) {
+  if (row.preview_mode === "price_change") {
+    const selectedCount = selectedSignupActivities(row).length;
+    const activityCount = (row.activities || []).length;
+    return el("button", {
+      class: selectedCount ? "signup-activity-button active" : "signup-activity-button",
+      title: (row.price_change_rows || []).map((item) => `${item.activity_id} ${item.activity_name || ""}`).join("\n"),
+      onclick: () => openSignupActivityPicker(row.product_id),
+    }, [`${selectedCount}/${activityCount} 更新`]);
+  }
   const activities = row.activities || [];
   if (!activities.length) return "";
   const selectedCount = selectedSignupActivities(row).length;
@@ -1047,40 +1214,27 @@ function signupActivityKey(row, activity) {
   return `${activity.activity_id}::${row.product_id}`;
 }
 
-function signupKey(row) {
-  return `${row.product_id}`;
-}
-
 function needsPriceFix(row) {
   return Number(row.price_mismatch_count || 0) > 0 || Number(row.missing_normal_price_count || 0) > 0;
-}
-
-function successfulSignupKeys(result, selectedRows) {
-  const keys = new Set();
-  const successfulActivityIds = new Set(
-    (result?.execution_results || [])
-      .filter((row) => row.submitted && !row.error && Number(row.params_count || 0) > 0)
-      .map((row) => String(row.activity_id)),
-  );
-  if (!successfulActivityIds.size) return keys;
-  selectedRows.forEach((row) => {
-    const allSucceeded = selectedSignupActivities(row).every((activity) => successfulActivityIds.has(String(activity.activity_id)));
-    if (allSucceeded) keys.add(signupKey(row));
-  });
-  return keys;
 }
 
 function logSignupResultDetails(result) {
   const executionRows = result?.execution_results || [];
   executionRows.forEach((row) => {
-    const status = row.error ? `失败：${row.error}` : row.submitted ? "已提交" : row.dry_run ? "预演" : "未提交";
+    const status = row.error ? `失败：${row.error}` : row.submit_success ? "平台确认成功" : row.submitted ? "请求已发送" : row.dry_run ? "预演" : "未提交";
     addLog(
-      row.error ? "error" : "info",
+      row.error ? "error" : row.submit_success ? "info" : "error",
       `报名活动 ${row.activity_id}`,
-      `新增商品${row.new_item_count ?? row.item_count}，保留已报名${row.preserved_item_count || 0}，提交商品${row.submit_item_count ?? row.item_count}，淘宝SKU明细${row.detail_count}，新增SKU${row.new_params_count ?? row.params_count}，保留SKU${row.preserved_params_count || 0}，忽略无报名价SKU${row.ignored_sku_count || 0}，总SKU${row.params_count}，${status}`,
+      `请求新增${row.new_item_count ?? row.item_count}，平台确认新增${(row.submitted_product_ids || []).length}，进入参数商品${(row.param_product_ids || []).length}，取消${row.removed_item_count || 0}，保留已报名${row.preserved_item_count || 0}，提交商品${row.submit_item_count ?? row.item_count}，淘宝SKU明细${row.detail_count}，新增SKU${row.new_params_count ?? row.params_count}，保留SKU${row.preserved_params_count || 0}，忽略无报名价SKU${row.ignored_sku_count || 0}，总SKU${row.params_count}，${status}`,
     );
     if ((row.ignored_product_ids || []).length) {
       addLog("info", "报名忽略商品", `${row.ignored_product_ids.slice(0, 20).join("、")}：全部SKU无顺手报名价`);
+    }
+    if ((row.failed_product_ids || []).length) {
+      addLog("error", "报名失败商品", `${row.failed_product_ids.slice(0, 20).join("、")}：${row.error ? "平台拒绝或本地参数校验失败" : "没有可提交SKU"}，未回写为已报名`);
+    }
+    if ((row.invalid_params || []).length) {
+      addLog("error", "报名参数异常", row.invalid_params.slice(0, 10).map((item) => `${item.product_id}/${item.sku_id}:${item.reason}`).join("；"));
     }
   });
 
@@ -1088,11 +1242,214 @@ function logSignupResultDetails(result) {
   skipped.slice(0, 20).forEach((row) => {
     const productId = row.product_id || "";
     const skuId = row.sku_id ? ` / SKU ${row.sku_id}` : "";
-    addLog("info", "报名跳过明细", `${productId}${skuId}：${row.reason || "未返回原因"}`);
+    const skuCode = row.sku_code ? ` / 编码 ${row.sku_code}` : "";
+    const skuName = row.sku_name ? ` / ${row.sku_name}` : "";
+    const signupPrice = row.signup_price !== undefined && row.signup_price !== null ? ` / 飞书报名价 ${formatMoney(row.signup_price)}` : "";
+    const level = String(row.reason || "").includes("平台置灰") ? "info" : "error";
+    addLog(level, "报名跳过明细", `${productId}${skuId}${skuCode}${skuName}${signupPrice}：${row.reason || "未返回原因"}`);
   });
   if (skipped.length > 20) {
     addLog("info", "报名跳过明细", `还有 ${skipped.length - 20} 条未展开，请缩小勾选范围后重试或查看接口返回`);
   }
+}
+
+function logSignupPriceChangeRows(rows) {
+  rows.filter((row) => row.changed).slice(0, 20).forEach((row) => {
+    addLog(
+      row.can_update ? "info" : "error",
+      "报名价变动明细",
+      `${row.product_id}，活动${row.activity_id}，SKU ${row.sku_id}：${formatMoney(row.current_signup_price)} -> ${formatMoney(row.feishu_signup_price)}${row.reason ? `，${row.reason}` : ""}`,
+    );
+  });
+  const changedCount = rows.filter((row) => row.changed).length;
+  if (changedCount > 20) addLog("info", "报名价变动明细", `还有 ${changedCount - 20} 条未展开`);
+}
+
+function buildSignupPriceChangePreviewRows(rows) {
+  const grouped = new Map();
+  rows.filter((row) => row.changed).forEach((row) => {
+    const productId = String(row.product_id || "");
+    if (!productId) return;
+    if (!grouped.has(productId)) {
+      grouped.set(productId, {
+        preview_mode: "price_change",
+        product_id: productId,
+        title: row.title || "",
+        image_url: row.image_url || "",
+        pxi_score: "",
+        joined_count: 0,
+        activities: [],
+        price_change_rows: [],
+        price_change_activity_ids: new Set(),
+        price_change_sku_ids: new Set(),
+        signup_price_min: null,
+        signup_price_max: null,
+        current_price_min: null,
+        current_price_max: null,
+        activities_by_id: new Map(),
+      });
+    }
+    const item = grouped.get(productId);
+    if (!item.title && row.title) item.title = row.title;
+    if (!item.image_url && row.image_url) item.image_url = row.image_url;
+    item.price_change_rows.push(row);
+    if (row.activity_id) {
+      const activityId = String(row.activity_id);
+      item.price_change_activity_ids.add(activityId);
+      if (!item.activities_by_id.has(activityId)) {
+        item.activities_by_id.set(activityId, {
+          activity_id: activityId,
+          activity_name: row.activity_name || "",
+          is_joined: 1,
+          selected: true,
+        });
+      }
+    }
+    if (row.sku_id) item.price_change_sku_ids.add(String(row.sku_id));
+  });
+  return [...grouped.values()].map((row) => {
+    const targetPrices = row.price_change_rows.map((item) => normalizeNumber(item.feishu_signup_price)).filter((value) => Number.isFinite(value));
+    const currentPrices = row.price_change_rows.map((item) => normalizeNumber(item.current_signup_price)).filter((value) => Number.isFinite(value));
+    row.joined_count = row.price_change_activity_ids.size;
+    row.price_change_count = row.price_change_rows.length;
+    row.price_change_activity_count = row.price_change_activity_ids.size;
+    row.price_change_sku_count = row.price_change_sku_ids.size;
+    row.activities = [...row.activities_by_id.values()];
+    row.signup_price_min = targetPrices.length ? Math.min(...targetPrices) : null;
+    row.signup_price_max = targetPrices.length ? Math.max(...targetPrices) : null;
+    row.current_price_min = currentPrices.length ? Math.min(...currentPrices) : null;
+    row.current_price_max = currentPrices.length ? Math.max(...currentPrices) : null;
+    delete row.price_change_activity_ids;
+    delete row.price_change_sku_ids;
+    delete row.activities_by_id;
+    return row;
+  });
+}
+
+function logSignupPriceUpdateRows(result) {
+  (result.execution_results || []).forEach((row) => {
+    const status = row.error ? `失败：${row.error}` : row.dry_run ? "预演" : row.submitted ? "已提交" : "未提交";
+    addLog(
+      row.error ? "error" : "info",
+      `更新报名价活动 ${row.activity_id}`,
+      `目标商品${row.target_item_count}，保留商品${row.preserved_item_count}，提交商品${row.submit_item_count}，更新SKU ${row.updated_params_count}，未变${row.unchanged_params_count}，保留SKU ${row.preserved_params_count}，${status}`,
+    );
+  });
+  (result.skipped_items || []).slice(0, 20).forEach((row) => {
+    addLog("error", "更新报名价跳过", `${row.product_id} / SKU ${row.sku_id}：${row.reason || ""}`);
+  });
+}
+
+async function verifySignupPriceUpdateResult({ platform, shop_id, productIds, assignmentsByActivity }) {
+  const watchedActivityIds = new Set(Object.keys(assignmentsByActivity || {}));
+  if (!watchedActivityIds.size) return;
+  addLog("info", "更新报名价后检测", `复查 ${productIds.length} 个商品 / ${watchedActivityIds.size} 个活动`);
+  const check = await api.post("/shunshou/signup/price-changes/detect", {
+    platform,
+    shop_id,
+    product_ids: productIds,
+    cross_shop: false,
+    batch_size: 25,
+    min_wait_seconds: 0.3,
+    max_wait_seconds: 0.6,
+  });
+  const remainRows = (check.rows || []).filter((row) => row.changed && watchedActivityIds.has(String(row.activity_id)));
+  if (remainRows.length) {
+    addLog("error", "更新报名价复查未通过", `仍有 ${remainRows.length} 条SKU价格未更新：${remainRows.slice(0, 10).map((row) => `${row.product_id}/${row.activity_id}/${row.sku_id}`).join("，")}`);
+  } else {
+    addLog("success", "更新报名价复查通过", "所选活动报名价已与飞书报名价一致");
+  }
+}
+
+async function verifySignupSubmitResult(config, changes, submitResult) {
+  const activityIds = [...new Set([...Object.keys(changes.assignments || {}), ...Object.keys(changes.removals || {})])];
+  if (!activityIds.length) return;
+  addLog("info", "报名后检测", `用SKU明细接口复查 ${activityIds.length} 个活动的实际状态`);
+  const failed = [];
+  const passed = [];
+  const skippedBeforeVerify = [];
+  const submittedByActivity = buildSubmittedSignupProductMap(submitResult);
+  const failedBeforeVerify = buildFailedSignupProductMap(submitResult);
+  const verifyAssignments = {};
+  const verifyRemovals = {};
+  activityIds.forEach((activityId) => {
+    (changes.assignments[activityId] || []).forEach((productId) => {
+      if ((failedBeforeVerify[activityId] || new Set()).has(String(productId))) {
+        skippedBeforeVerify.push(`${productId}/${activityId}:无可提交SKU`);
+        return;
+      }
+      if (!(submittedByActivity[activityId] || new Set()).has(String(productId))) {
+        skippedBeforeVerify.push(`${productId}/${activityId}:未进入提交参数`);
+        return;
+      }
+      if (!verifyAssignments[activityId]) verifyAssignments[activityId] = [];
+      verifyAssignments[activityId].push(String(productId));
+    });
+    if ((changes.removals[activityId] || []).length) {
+      verifyRemovals[activityId] = (changes.removals[activityId] || []).map((productId) => String(productId));
+    }
+  });
+  const verifyResult = await api.post("/shunshou/signup/verify", {
+    platform: config.platform,
+    shop_id: config.shop_id,
+    assignments_by_activity: verifyAssignments,
+    remove_assignments_by_activity: verifyRemovals,
+    cross_shop: config.cross_shop,
+    batch_size: 25,
+    min_wait_seconds: 0.3,
+    max_wait_seconds: 0.6,
+  });
+  (verifyResult.rows || []).forEach((row) => {
+    const text = `${row.product_id}/${row.activity_id}:${row.reason || ""}`;
+    if (row.ok) passed.push(text);
+    else failed.push(text);
+  });
+  if (skippedBeforeVerify.length) {
+    addLog("error", "报名提交前失败", `${skippedBeforeVerify.length} 条：${skippedBeforeVerify.slice(0, 12).join("；")}`);
+  }
+  if (failed.length) {
+    addLog("error", "报名后检测未通过", `${failed.length} 条：${failed.slice(0, 12).join("；")}`);
+  }
+  const message = [
+    `报名后检测完成`,
+    `成功：${passed.length} 条`,
+    `提交前失败：${skippedBeforeVerify.length} 条`,
+    `复查失败：${failed.length} 条`,
+    "",
+    ...passed.slice(0, 8),
+    ...skippedBeforeVerify.slice(0, 8),
+    ...failed.slice(0, 8),
+  ].join("\n");
+  alert(message);
+  if (failed.length || skippedBeforeVerify.length) {
+    addLog("error", "报名后检测完成", `成功${passed.length}，提交前失败${skippedBeforeVerify.length}，复查失败${failed.length}`);
+  } else {
+    addLog("success", "报名后检测通过", `所选活动商品状态已确认，成功${passed.length}条`);
+  }
+}
+
+function buildSubmittedSignupProductMap(result) {
+  const grouped = {};
+  (result?.execution_results || []).forEach((row) => {
+    const activityId = String(row.activity_id || "");
+    if (!activityId) return;
+    grouped[activityId] = new Set((row.submit_success ? row.submitted_product_ids || [] : []).map((productId) => String(productId)));
+  });
+  return grouped;
+}
+
+function buildFailedSignupProductMap(result) {
+  const grouped = {};
+  (result?.execution_results || []).forEach((row) => {
+    const activityId = String(row.activity_id || "");
+    if (!activityId) return;
+    const failedIds = new Set((row.failed_product_ids || row.ignored_product_ids || []).map((productId) => String(productId)));
+    if (!row.submit_success) {
+      (row.param_product_ids || []).forEach((productId) => failedIds.add(String(productId)));
+    }
+    grouped[activityId] = failedIds;
+  });
+  return grouped;
 }
 
 function logRelistDetails(result, productContextMap = new Map()) {
@@ -1166,25 +1523,11 @@ function modifyFlowText(editPrice, updateInventory, upshelf) {
 }
 
 function renderProductThumb(url) {
-  if (!url) return "";
-  return el("button", { class: "product-thumb-button", title: "查看主图", onclick: () => openImagePreview(url) }, [
-    el("img", { class: "product-thumb", src: url, alt: "主图", loading: "lazy" }),
-    el("span", { class: "product-thumb-eye" }),
-  ]);
+  return renderThumbButton(url, { onOpen: openImagePreview });
 }
 
 function renderImagePreviewModal() {
-  return el("div", { class: previewImageUrl ? "modal-mask open" : "modal-mask", onclick: closeImagePreview }, [
-    el("div", { class: "image-preview-modal", onclick: (event) => event.stopPropagation() }, [
-      el("div", { class: "modal-header" }, [
-        el("strong", { text: "主图预览" }),
-        el("button", { class: "ghost", onclick: closeImagePreview }, ["关闭"]),
-      ]),
-      el("div", { class: "image-preview-body" }, [
-        previewImageUrl ? el("img", { class: "image-preview", src: previewImageUrl, alt: "主图预览" }) : "",
-      ]),
-    ]),
-  ]);
+  return renderImagePreview({ url: previewImageUrl, onClose: closeImagePreview });
 }
 
 function renderSignupModal() {
@@ -1198,7 +1541,9 @@ function renderSignupModal() {
         el("div", { class: "form-grid" }, [
           formField("PXI分大于", "shunshou-pxi-min", pxiMin, "0"),
           formField("累计销量大于等于", "shunshou-sold-min", soldTotalMin, "0"),
-          formField("每商品目标活动数", "shunshou-target-count", targetActivityCount, "1"),
+          formField("商品ID", "shunshou-signup-product-id", signupProductId, "", "", "text"),
+          formField("已报活动数最小", "shunshou-joined-min", joinedCountMin, "0"),
+          formField("已报活动数最大", "shunshou-joined-max", joinedCountMax, "0"),
           formField("单活动报名上限", "shunshou-signup-limit", signupLimit, "1", "171"),
         ]),
         el("div", { class: "modal-actions" }, [
@@ -1261,17 +1606,17 @@ function renderSignupActivityPickerModal() {
   return el("div", { class: row ? "modal-mask open" : "modal-mask", onclick: closeSignupActivityPicker }, [
     row ? el("div", { class: "modal signup-activity-modal", onclick: (event) => event.stopPropagation() }, [
       el("div", { class: "modal-header" }, [
-        el("strong", { text: "选择报名活动" }),
+        el("strong", { text: row.preview_mode === "price_change" ? "选择更新价格的活动" : "选择报名活动" }),
         el("button", { class: "ghost", onclick: closeSignupActivityPicker }, ["关闭"]),
       ]),
       el("div", { class: "modal-body" }, [
         el("div", { class: "signup-activity-product" }, [
           el("div", { class: "signup-activity-product-id", text: row.product_id }),
           el("div", { class: "muted", text: row.title || "" }),
-        ]),
+        ]), 
         el("div", { class: "signup-activity-picker-actions" }, [
-          el("button", { onclick: async () => { toggleSignupRow(row, true); await window.renderActiveModule(); } }, ["全选"]),
-          el("button", { onclick: async () => { toggleSignupRow(row, false); await window.renderActiveModule(); } }, ["全不选"]),
+          el("button", { onclick: async () => { toggleSignupRowActivities(row, true); await window.renderActiveModule(); } }, [row.preview_mode === "price_change" ? "全选更新" : "全选活动"]),
+          el("button", { onclick: async () => { toggleSignupRowActivities(row, false); await window.renderActiveModule(); } }, [row.preview_mode === "price_change" ? "全不更新" : "全不选活动"]),
         ]),
         el("div", { class: "signup-activity-picker-list" }, (row.activities || []).map((activity) =>
           el("label", { class: "signup-activity-picker-row" }, [
@@ -1285,6 +1630,7 @@ function renderSignupActivityPickerModal() {
             }),
             el("span", { class: "signup-activity-picker-id", text: activity.activity_id }),
             el("span", { class: "signup-activity-picker-name", text: activity.activity_name || "" }),
+            Number(activity.is_joined || 0) === 1 ? el("span", { class: "signup-activity-joined", text: row.preview_mode === "price_change" ? "待更新" : "已报名" }) : "",
           ]),
         )),
       ]),
@@ -1295,13 +1641,13 @@ function renderSignupActivityPickerModal() {
   ]);
 }
 
-function formField(labelText, id, value, min, max = "") {
+function formField(labelText, id, value, min, max = "", type = "number") {
   const attrs = {
     id,
-    type: "number",
-    min,
+    type,
     value: String(value),
   };
+  if (min !== "") attrs.min = min;
   if (max) attrs.max = max;
   return el("div", { class: "form-row" }, [
     el("label", { for: id, text: labelText }),
@@ -1326,10 +1672,14 @@ function formatCapacity(row) {
 }
 
 function formatSignupPrice(row) {
+  if (row.preview_mode === "price_change") {
+    return `${formatPriceRange(row.current_price_min, row.current_price_max) || "-"} -> ${formatPriceRange(row.signup_price_min, row.signup_price_max) || "-"}`;
+  }
   return formatPriceRange(row.signup_price_min, row.signup_price_max);
 }
 
 function formatSignupPriceStatus(row) {
+  if (row.preview_mode === "price_change") return `变动${row.price_change_count || 0}`;
   const mismatch = Number(row.price_mismatch_count || 0);
   const missing = Number(row.missing_normal_price_count || 0);
   if (missing > 0) return `缺正常价${missing}`;
@@ -1339,10 +1689,19 @@ function formatSignupPriceStatus(row) {
 
 function renderSignupPriceStatus(row) {
   const text = formatSignupPriceStatus(row);
+  if (row.preview_mode === "price_change") return el("span", { class: "price-status-danger", text });
   return el("span", { class: needsPriceFix(row) ? "price-status-danger" : "price-status-ok", text });
 }
 
 function signupPriceStatusTitle(row) {
+  if (row.preview_mode === "price_change") {
+    return [
+      `报名价变动：${row.price_change_count || 0} 条SKU记录`,
+      `当前报名价：${formatPriceRange(row.current_price_min, row.current_price_max) || "-"}`,
+      `飞书报名价：${formatPriceRange(row.signup_price_min, row.signup_price_max) || "-"}`,
+      `涉及活动：${(row.price_change_rows || []).map((item) => `${item.activity_id} ${item.activity_name || ""}`).join(" / ")}`,
+    ].join("\n");
+  }
   return [
     `价格检查：${formatSignupPriceStatus(row)}`,
     `正常售价：${formatPriceRange(row.normal_price_min, row.normal_price_max) || "-"}`,
@@ -1359,12 +1718,6 @@ function formatPriceRange(minValue, maxValue) {
   if (!Number.isFinite(min) && !Number.isFinite(max)) return "";
   if (!Number.isFinite(max) || min === max) return formatMoney(min);
   return `${formatMoney(min)}-${formatMoney(max)}`;
-}
-
-function formatMoney(value) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return "";
-  return number.toFixed(2).replace(/\.?0+$/, "");
 }
 
 function formatSyncStatus(status) {
@@ -1391,19 +1744,8 @@ function shopLabel(value) {
   return shop?.shop_name || value || "";
 }
 
-function formatTime(value) {
-  if (!value) return "";
-  return new Date(value).toLocaleString("zh-CN", { hour12: false });
-}
-
 function normalizeSignupLimit(value) {
   const number = Number(value || 160);
   if (!Number.isFinite(number)) return 160;
   return Math.max(1, Math.min(171, Math.floor(number)));
-}
-
-function normalizeNumber(value, fallback) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return fallback;
-  return Math.max(0, number);
 }
